@@ -3,15 +3,16 @@ import config
 import google.generativeai as genai
 import json
 import asyncio
-from fastapi import FastAPI, HTTPException
+import secrets # New import for generating secure keys
+from fastapi import FastAPI, HTTPException, Depends, Header # New imports
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import AsyncClient
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Annotated # New import
 import uuid
 from datetime import datetime, timedelta
 
-# --- Pydantic models ---
+# --- Pydantic models (some are new) ---
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
     user_id: str
@@ -37,7 +38,6 @@ class DashboardStats(BaseModel):
     total_transactions_24h: int
     success_rate_24h: float
     avg_speed: str
-# NEW: Add models for the paginated transaction list
 class TransactionDetail(BaseModel):
     id: uuid.UUID
     created_at: datetime
@@ -50,11 +50,13 @@ class PaginatedTransactionsResponse(BaseModel):
     total_count: int
     page: int
     page_size: int
+class ApiKeyResponse(BaseModel): # New model
+    api_key: Optional[str] = None
 # --- End of Pydantic models ---
 
 app = FastAPI(title="AI Payment Routing Engine")
 
-# --- CORS Middleware ---
+# --- CORS Middleware (Unchanged) ---
 origins = [ "http://localhost:5173" ]
 app.add_middleware(
     CORSMiddleware,
@@ -71,7 +73,25 @@ genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- End of Config ---
 
+# NEW: Authentication dependency to protect routes
+async def get_current_user(authorization: Annotated[str | None, Header()] = None):
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+
+    token = authorization.split(" ")[1]
+    try:
+        # The service key allows us to validate any user's token
+        auth_client = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
+        user_response = await auth_client.auth.get_user(jwt=token)
+        user = user_response.user
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user
+    except Exception:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]: # Unchanged
+    # ... (function content is the same)
     strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     if transaction.strategy == "MAX_SUCCESS":
         strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction. Prioritize the highest success rate, even if fees are slightly higher."
@@ -100,8 +120,36 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
 def read_root(): # Unchanged
     return {"message": "AI Payment Routing Engine is running."}
 
+# NEW: Add the secure endpoints for API keys
+@app.get("/api-key", response_model=ApiKeyResponse)
+async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
+
+    if response.data:
+        return ApiKeyResponse(api_key=response.data.get("api_key"))
+    return ApiKeyResponse(api_key=None)
+
+@app.post("/api-key/generate", response_model=ApiKeyResponse)
+async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    # Generate a new secure key, e.g., "sk_xxxxxxxxxxxxxxxx"
+    new_key = f"sk_{secrets.token_urlsafe(24)}"
+
+    response, error = await supabase.from_("profiles") \
+        .update({"api_key": new_key}) \
+        .eq("id", user_id) \
+        .execute()
+
+    # Check for errors from the update operation
+    if error and error.message:
+         raise HTTPException(status_code=500, detail=f"Could not update API key: {error.message}")
+
+    return ApiKeyResponse(api_key=new_key)
+
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(transaction: Transaction): # Unchanged
+    # ... (function content is the same)
     psps_response = await supabase.from_("psps").select("id, name, success_rate, fee_percent, speed_score, risk_score").eq("is_active", True).execute()
     active_psps = psps_response.data
     if not active_psps:
@@ -136,6 +184,7 @@ async def route_transaction(transaction: Transaction): # Unchanged
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate): # Unchanged
+    # ... (function content is the same)
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -146,6 +195,7 @@ async def update_transaction_status(update_data: TransactionStatusUpdate): # Unc
 
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats(): # Unchanged
+    # ... (function content is the same)
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
     try:
         response = await supabase.from_("transactions").select("amount, status").gte("created_at", twenty_four_hours_ago.isoformat()).execute()
@@ -161,9 +211,9 @@ async def get_dashboard_stats(): # Unchanged
         print(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
 
-# NEW: Add the endpoint to get a paginated list of transactions
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
-async def get_transactions(page: int = 1, page_size: int = 10):
+async def get_transactions(page: int = 1, page_size: int = 10): # Unchanged
+    # ... (function content is the same)
     try:
         offset = (page - 1) * page_size
         response = await supabase.from_("transactions") \
