@@ -4,7 +4,6 @@ import google.generativeai as genai
 import json
 import asyncio
 from fastapi import FastAPI, HTTPException
-# NEW: Import the CORS middleware
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import AsyncClient
 from pydantic import BaseModel, Field
@@ -12,7 +11,7 @@ from typing import List, Optional, Literal
 import uuid
 from datetime import datetime, timedelta
 
-# --- All your Pydantic models (Transaction, etc.) are the same ---
+# --- All Pydantic models ---
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
     user_id: str
@@ -33,34 +32,41 @@ class RankedPsp(BaseModel):
     reason: str
 class RoutingResponse(BaseModel):
     ranked_psps: List[RankedPsp]
+# NEW: Add a model for our dashboard stats
+class DashboardStats(BaseModel):
+    total_volume_24h: float
+    total_transactions_24h: int
+    success_rate_24h: float
+    avg_speed: str
 # --- End of Pydantic models ---
 
 
-# This line is the same
 app = FastAPI(title="AI Payment Routing Engine")
 
-# NEW: Add the CORS "guest list" configuration
+# --- CORS Middleware ---
 origins = [
-    "http://localhost:5173", # Your local frontend
-    # Add any future frontend URLs here, e.g., the URL from Vercel
+    "http://localhost:5173",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"], # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+# --- End of CORS ---
 
-# --- All your other backend code (database connections, endpoints, etc.) is the same ---
+
+# --- Supabase and Gemini Config ---
 supabase: AsyncClient = AsyncClient(
     config.SUPABASE_URL,
     config.SUPABASE_SERVICE_KEY
 )
 genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+# --- End of Config ---
 
+# The get_psp_score function is unchanged
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
     strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     if transaction.strategy == "MAX_SUCCESS":
@@ -85,12 +91,14 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
         print(f"Error scoring PSP {psp.get('name')}: {e}")
         return None
 
+# --- API Endpoints ---
 @app.get("/")
 def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(transaction: Transaction):
+    # This function is unchanged
     psps_response = await supabase.from_("psps").select("id, name, success_rate, fee_percent, speed_score, risk_score").eq("is_active", True).execute()
     active_psps = psps_response.data
     if not active_psps:
@@ -125,6 +133,7 @@ async def route_transaction(transaction: Transaction):
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
+    # This function is unchanged
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -133,4 +142,39 @@ async def update_transaction_status(update_data: TransactionStatusUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to update transaction status.")
 
-# --- End of backend code ---
+# NEW: Add the endpoint to get dashboard stats
+@app.get("/dashboard-stats", response_model=DashboardStats)
+async def get_dashboard_stats():
+    twenty_four_hours_ago = datetime.now() - timedelta(days=1)
+
+    try:
+        # Query transactions from the last 24 hours
+        response = await supabase.from_("transactions") \
+            .select("amount, status") \
+            .gte("created_at", twenty_four_hours_ago.isoformat()) \
+            .execute()
+
+        if not response.data:
+            return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
+
+        transactions = response.data
+
+        total_volume = sum(t['amount'] for t in transactions if t.get('amount'))
+        total_transactions = len(transactions)
+
+        completed_transactions = len([
+            t for t in transactions 
+            if t.get('status') and t.get('status').lower() == 'completed'
+        ])
+
+        success_rate = (completed_transactions / total_transactions * 100) if total_transactions > 0 else 0
+
+        return DashboardStats(
+            total_volume_24h=total_volume,
+            total_transactions_24h=total_transactions,
+            success_rate_24h=success_rate,
+            avg_speed="1.2s" # This value is static for now
+        )
+    except Exception as e:
+        print(f"Error fetching dashboard stats: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
