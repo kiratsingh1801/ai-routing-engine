@@ -11,7 +11,7 @@ from typing import List, Optional, Literal
 import uuid
 from datetime import datetime, timedelta
 
-# --- All Pydantic models ---
+# --- Pydantic models ---
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
     user_id: str
@@ -32,21 +32,30 @@ class RankedPsp(BaseModel):
     reason: str
 class RoutingResponse(BaseModel):
     ranked_psps: List[RankedPsp]
-# NEW: Add a model for our dashboard stats
 class DashboardStats(BaseModel):
     total_volume_24h: float
     total_transactions_24h: int
     success_rate_24h: float
     avg_speed: str
+# NEW: Add models for the paginated transaction list
+class TransactionDetail(BaseModel):
+    id: uuid.UUID
+    created_at: datetime
+    amount: float
+    currency: str
+    geo: str
+    status: Optional[str] = None
+class PaginatedTransactionsResponse(BaseModel):
+    transactions: List[TransactionDetail]
+    total_count: int
+    page: int
+    page_size: int
 # --- End of Pydantic models ---
-
 
 app = FastAPI(title="AI Payment Routing Engine")
 
 # --- CORS Middleware ---
-origins = [
-    "http://localhost:5173",
-]
+origins = [ "http://localhost:5173" ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -56,18 +65,13 @@ app.add_middleware(
 )
 # --- End of CORS ---
 
-
-# --- Supabase and Gemini Config ---
-supabase: AsyncClient = AsyncClient(
-    config.SUPABASE_URL,
-    config.SUPABASE_SERVICE_KEY
-)
+# --- Supabase and Gemini Config (Unchanged) ---
+supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- End of Config ---
 
-# The get_psp_score function is unchanged
-async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
+async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]: # Unchanged
     strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     if transaction.strategy == "MAX_SUCCESS":
         strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction. Prioritize the highest success rate, even if fees are slightly higher."
@@ -93,12 +97,11 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
 
 # --- API Endpoints ---
 @app.get("/")
-def read_root():
+def read_root(): # Unchanged
     return {"message": "AI Payment Routing Engine is running."}
 
 @app.post("/route-transaction", response_model=RoutingResponse)
-async def route_transaction(transaction: Transaction):
-    # This function is unchanged
+async def route_transaction(transaction: Transaction): # Unchanged
     psps_response = await supabase.from_("psps").select("id, name, success_rate, fee_percent, speed_score, risk_score").eq("is_active", True).execute()
     active_psps = psps_response.data
     if not active_psps:
@@ -132,8 +135,7 @@ async def route_transaction(transaction: Transaction):
     return RoutingResponse(ranked_psps=ranked_response_list)
 
 @app.post("/update-transaction-status")
-async def update_transaction_status(update_data: TransactionStatusUpdate):
-    # This function is unchanged
+async def update_transaction_status(update_data: TransactionStatusUpdate): # Unchanged
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -142,39 +144,43 @@ async def update_transaction_status(update_data: TransactionStatusUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to update transaction status.")
 
-# NEW: Add the endpoint to get dashboard stats
 @app.get("/dashboard-stats", response_model=DashboardStats)
-async def get_dashboard_stats():
+async def get_dashboard_stats(): # Unchanged
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
-
     try:
-        # Query transactions from the last 24 hours
-        response = await supabase.from_("transactions") \
-            .select("amount, status") \
-            .gte("created_at", twenty_four_hours_ago.isoformat()) \
-            .execute()
-
+        response = await supabase.from_("transactions").select("amount, status").gte("created_at", twenty_four_hours_ago.isoformat()).execute()
         if not response.data:
             return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
-
         transactions = response.data
-
         total_volume = sum(t['amount'] for t in transactions if t.get('amount'))
         total_transactions = len(transactions)
-
-        completed_transactions = len([
-            t for t in transactions 
-            if t.get('status') and t.get('status').lower() == 'completed'
-        ])
-
+        completed_transactions = len([t for t in transactions if t.get('status') and t.get('status').lower() == 'completed'])
         success_rate = (completed_transactions / total_transactions * 100) if total_transactions > 0 else 0
-
-        return DashboardStats(
-            total_volume_24h=total_volume,
-            total_transactions_24h=total_transactions,
-            success_rate_24h=success_rate,
-            avg_speed="1.2s" # This value is static for now
-        )
+        return DashboardStats(total_volume_24h=total_volume, total_transactions_24h=total_transactions, success_rate_24h=success_rate, avg_speed="1.2s")
     except Exception as e:
         print(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
+
+# NEW: Add the endpoint to get a paginated list of transactions
+@app.get("/transactions", response_model=PaginatedTransactionsResponse)
+async def get_transactions(page: int = 1, page_size: int = 10):
+    try:
+        offset = (page - 1) * page_size
+        response = await supabase.from_("transactions") \
+            .select("id, created_at, amount, currency, geo, status", count='exact') \
+            .order("created_at", desc=True) \
+            .range(offset, offset + page_size - 1) \
+            .execute()
+
+        transactions_data = response.data or []
+        total_count = response.count or 0
+
+        return PaginatedTransactionsResponse(
+            transactions=transactions_data,
+            total_count=total_count,
+            page=page,
+            page_size=page_size
+        )
+    except Exception as e:
+        print(f"Error fetching transactions: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch transactions.")
