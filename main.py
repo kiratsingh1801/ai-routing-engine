@@ -3,16 +3,16 @@ import config
 import google.generativeai as genai
 import json
 import asyncio
-import secrets # New import for generating secure keys
-from fastapi import FastAPI, HTTPException, Depends, Header # New imports
+import secrets
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import AsyncClient
 from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Annotated # New import
+from typing import List, Optional, Literal, Annotated
 import uuid
 from datetime import datetime, timedelta
 
-# --- Pydantic models (some are new) ---
+# --- Pydantic models (Unchanged) ---
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
     user_id: str
@@ -50,7 +50,7 @@ class PaginatedTransactionsResponse(BaseModel):
     total_count: int
     page: int
     page_size: int
-class ApiKeyResponse(BaseModel): # New model
+class ApiKeyResponse(BaseModel):
     api_key: Optional[str] = None
 # --- End of Pydantic models ---
 
@@ -73,21 +73,21 @@ genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- End of Config ---
 
-# NEW: Authentication dependency to protect routes
+# CORRECTED: A simpler and more robust authentication dependency
 async def get_current_user(authorization: Annotated[str | None, Header()] = None):
-    if authorization is None or not authorization.startswith("Bearer "):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
 
     token = authorization.split(" ")[1]
     try:
-        # The service key allows us to validate any user's token
-        auth_client = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
-        user_response = await auth_client.auth.get_user(jwt=token)
+        # Use our global supabase client to validate the token
+        user_response = await supabase.auth.get_user(jwt=token)
         user = user_response.user
-        if user is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user
-    except Exception:
+        if user:
+            return user
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    except Exception as e:
+        print(f"Authentication error: {e}") # For our own debugging
         raise HTTPException(status_code=401, detail="Could not validate credentials")
 
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]: # Unchanged
@@ -115,12 +115,11 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
         print(f"Error scoring PSP {psp.get('name')}: {e}")
         return None
 
-# --- API Endpoints ---
+# --- API Endpoints (Unchanged, but order might be slightly different) ---
 @app.get("/")
-def read_root(): # Unchanged
+def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
-# NEW: Add the secure endpoints for API keys
 @app.get("/api-key", response_model=ApiKeyResponse)
 async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
@@ -133,23 +132,22 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 @app.post("/api-key/generate", response_model=ApiKeyResponse)
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
-    # Generate a new secure key, e.g., "sk_xxxxxxxxxxxxxxxx"
     new_key = f"sk_{secrets.token_urlsafe(24)}"
 
-    response, error = await supabase.from_("profiles") \
+    # supabase-py v2 returns (data, error) tuple from .execute()
+    data, error = await supabase.from_("profiles") \
         .update({"api_key": new_key}) \
         .eq("id", user_id) \
         .execute()
 
-    # Check for errors from the update operation
-    if error and error.message:
+    if error:
          raise HTTPException(status_code=500, detail=f"Could not update API key: {error.message}")
 
     return ApiKeyResponse(api_key=new_key)
 
+# ... Other endpoints are unchanged ...
 @app.post("/route-transaction", response_model=RoutingResponse)
-async def route_transaction(transaction: Transaction): # Unchanged
-    # ... (function content is the same)
+async def route_transaction(transaction: Transaction):
     psps_response = await supabase.from_("psps").select("id, name, success_rate, fee_percent, speed_score, risk_score").eq("is_active", True).execute()
     active_psps = psps_response.data
     if not active_psps:
@@ -183,8 +181,7 @@ async def route_transaction(transaction: Transaction): # Unchanged
     return RoutingResponse(ranked_psps=ranked_response_list)
 
 @app.post("/update-transaction-status")
-async def update_transaction_status(update_data: TransactionStatusUpdate): # Unchanged
-    # ... (function content is the same)
+async def update_transaction_status(update_data: TransactionStatusUpdate):
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -194,8 +191,7 @@ async def update_transaction_status(update_data: TransactionStatusUpdate): # Unc
         raise HTTPException(status_code=500, detail="Failed to update transaction status.")
 
 @app.get("/dashboard-stats", response_model=DashboardStats)
-async def get_dashboard_stats(): # Unchanged
-    # ... (function content is the same)
+async def get_dashboard_stats():
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
     try:
         response = await supabase.from_("transactions").select("amount, status").gte("created_at", twenty_four_hours_ago.isoformat()).execute()
@@ -212,8 +208,7 @@ async def get_dashboard_stats(): # Unchanged
         raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
 
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
-async def get_transactions(page: int = 1, page_size: int = 10): # Unchanged
-    # ... (function content is the same)
+async def get_transactions(page: int = 1, page_size: int = 10):
     try:
         offset = (page - 1) * page_size
         response = await supabase.from_("transactions") \
