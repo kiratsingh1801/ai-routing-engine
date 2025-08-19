@@ -73,7 +73,6 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    # This explicit header allowance is the critical fix
     allow_headers=["*", "Authorization"],
 )
 # --- End of CORS ---
@@ -104,9 +103,9 @@ async def get_current_user(authorization: Annotated[str | None, Header()] = None
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
     strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     if transaction.strategy == "MAX_SUCCESS":
-        strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction."
+        strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction. Prioritize the highest success rate, even if fees are slightly higher."
     elif transaction.strategy == "MIN_COST":
-        strategy_instruction = "Your primary goal is to minimize the cost of the transaction."
+        strategy_instruction = "Your primary goal is to minimize the cost of the transaction. Prioritize the lowest fee, even if the success rate is slightly lower."
     
     transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
     if transaction.payment_method:
@@ -118,7 +117,7 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
         
-    prompt = f"""You are a world-class Payment Routing Analyst...
+    prompt = f"""You are a world-class Payment Routing Analyst.
 **Your Guiding Strategy:** {strategy_instruction}
 **Transaction Details:**
     {transaction_details}
@@ -130,7 +129,7 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
 * Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
 **Live Historical Insights:**
 {historical_insights if historical_insights else "No recent transaction history for this specific route."}
-IMPORTANT: Respond ONLY with a valid JSON object...
+IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
 {{
 "score": <your_score_here_0_to_100>,
 "reason": "<your_reason_here>"
@@ -163,10 +162,14 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
     
-    data, error = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
+    response = await supabase.from_("profiles") \
+        .update({"api_key": new_key}) \
+        .eq("id", user_id) \
+        .execute()
 
-    if error:
-         raise HTTPException(status_code=500, detail=f"Could not update API key: {error.message}")
+    if not response.data:
+         print(f"Supabase error during key generation: {response.error}")
+         raise HTTPException(status_code=500, detail="Could not update API key in database.")
 
     return ApiKeyResponse(api_key=new_key)
 
@@ -177,7 +180,6 @@ async def route_transaction(transaction: Transaction):
     if not active_psps:
         raise HTTPException(status_code=404, detail="No active PSPs found.")
     
-    # ... (rest of the function is the same)
     psp_ids = [psp['id'] for psp in active_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
@@ -209,12 +211,16 @@ async def route_transaction(transaction: Transaction):
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
     try:
-        data, error = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
-        if error or not data:
+        response = await supabase.from_("transactions") \
+            .update({"status": update_data.status}) \
+            .eq("id", str(update_data.transaction_id)) \
+            .execute()
+            
+        if not response.data:
             raise HTTPException(status_code=404, detail=f"Transaction with ID {update_data.transaction_id} not found.")
         return {"message": "Transaction status updated successfully."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to update transaction status.")
+        raise HTTPException(status_code=500, detail=f"Failed to update transaction status: {e}")
 
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats():
