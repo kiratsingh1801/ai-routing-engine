@@ -66,6 +66,7 @@ app = FastAPI(title="AI Payment Routing Engine")
 # --- CORS Middleware ---
 origins = [
     "http://localhost:5173",
+    "https://ai-routing-v2.vercel.app/",
     # You will add your Vercel deployment URL here later
 ]
 app.add_middleware(
