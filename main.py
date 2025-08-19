@@ -1,5 +1,4 @@
 # main.py
-# ... (all imports and Pydantic models are the same)
 import config
 import google.generativeai as genai
 import json
@@ -13,34 +12,36 @@ from typing import List, Optional, Literal, Annotated
 import uuid
 from datetime import datetime, timedelta
 
-# --- Pydantic models with Documentation ---
+# --- Pydantic models ---
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
-    # user_id is no longer needed here, we get it from the session
-    amount: float = Field(..., example=100.00, description="The payment amount.")
-    currency: str = Field(..., example="USD", description="The three-letter ISO currency code.")
-    country: str = Field(..., alias='geo', example="US", description="The two-letter ISO country code of the user.")
-    card_bin: Optional[str] = Field(None, example="424242", description="The first 6 digits of the user's credit card.")
-    payment_method: Optional[str] = Field(None, example="credit_card", description="The payment method used.")
-    strategy: Literal["BALANCED", "MAX_SUCCESS", "MIN_COST"] = Field("BALANCED", description="The routing strategy to use.")
+    amount: float = Field(..., example=100.00)
+    currency: str = Field(..., example="USD")
+    country: str = Field(..., alias='geo', example="US")
+    card_bin: Optional[str] = Field(None, example="424242")
+    payment_method: Optional[str] = Field(None, example="credit_card")
+    strategy: Literal["BALANCED", "MAX_SUCCESS", "MIN_COST"] = "BALANCED"
 
-# ... (rest of the models are the same)
 class TransactionStatusUpdate(BaseModel):
     transaction_id: uuid.UUID
     status: str = Field(..., example="completed")
+
 class RankedPsp(BaseModel):
     rank: int
     psp_id: str
     psp_name: str
     score: int
     reason: str
+
 class RoutingResponse(BaseModel):
     ranked_psps: List[RankedPsp]
+
 class DashboardStats(BaseModel):
     total_volume_24h: float
     total_transactions_24h: int
     success_rate_24h: float
     avg_speed: str
+
 class TransactionDetail(BaseModel):
     id: uuid.UUID
     created_at: datetime
@@ -48,11 +49,13 @@ class TransactionDetail(BaseModel):
     currency: str
     geo: str
     status: Optional[str] = None
+
 class PaginatedTransactionsResponse(BaseModel):
     transactions: List[TransactionDetail]
     total_count: int
     page: int
     page_size: int
+
 class ApiKeyResponse(BaseModel):
     api_key: Optional[str] = None
 
@@ -62,14 +65,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ... (CORS, Supabase/Gemini config, and Auth dependency are the same)
 origins = [ "http://localhost:5173", "https://ai-routing-v2.vercel.app" ]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*", "Authorization"])
+
 supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+
 async def get_current_user(authorization: Annotated[str | None, Header()] = None):
-    # ... (function is the same)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
     token = authorization.split(" ")[1]
@@ -82,8 +85,8 @@ async def get_current_user(authorization: Annotated[str | None, Header()] = None
         print(f"Authentication error: {e}")
         raise HTTPException(status_code=401, detail="Could not validate credentials")
 
-async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]: # Unchanged
-    # ... (function is the same)
+async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
+    # ... (function is the same, just keeping it here for completeness)
     strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     if transaction.strategy == "MAX_SUCCESS":
         strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction."
@@ -97,7 +100,7 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
     historical_insights = ""
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
-    prompt = f"""...""" # (rest of prompt is the same)
+    prompt = f"""You are a world-class Payment Routing Analyst... (rest of prompt is the same)"""
     try:
         ai_response = await gemini_model.generate_content_async(prompt)
         cleaned_response_text = ai_response.text.strip().replace("```json", "").replace("```", "")
@@ -107,12 +110,10 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
         print(f"Error scoring PSP {psp.get('name')}: {e}")
         return None
 
-# --- API Endpoints ---
 @app.get("/")
-def read_root(): # Unchanged
+def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
-# The get_api_key and generate_api_key endpoints are unchanged
 @app.get("/api-key", response_model=ApiKeyResponse)
 async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
@@ -130,17 +131,21 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
          raise HTTPException(status_code=500, detail="Could not update API key in database.")
     return ApiKeyResponse(api_key=new_key)
 
-# CORRECTED: This is now a secure endpoint
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(transaction: Transaction, current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
-    # ... (rest of the function is the same, but we need to pass user_id to the db)
-    # We also need to update the transaction record with the user_id
-    # Let's assume the transaction_id in the request body refers to an existing record.
-    # We will update it with the user_id.
-    await supabase.from_("transactions").update({"user_id": user_id}).eq("id", str(transaction.transaction_id)).execute()
 
-    psps_response = await supabase.from_("psps").select("id, name, success_rate, fee_percent, speed_score, risk_score").eq("is_active", True).execute()
+    # Create or update the transaction record with the user_id
+    await supabase.from_("transactions").upsert({
+        "id": str(transaction.transaction_id),
+        "user_id": user_id,
+        "amount": transaction.amount,
+        "currency": transaction.currency,
+        "geo": transaction.country,
+        "payment_method": transaction.payment_method,
+    }).execute()
+
+    psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     # ... (rest of function is the same)
     active_psps = psps_response.data
     if not active_psps:
@@ -173,9 +178,8 @@ async def route_transaction(transaction: Transaction, current_user: Annotated[di
         await supabase.from_("transactions").update({"routed_psp_id": top_ranked_psp.psp_id, "status": "routed (AI choice)"}).eq("id", str(transaction.transaction_id)).execute()
     return RoutingResponse(ranked_psps=ranked_response_list)
 
-@app.post("/update-transaction-status", response_model=TransactionStatusUpdate)
-async def update_transaction_status(update_data: TransactionStatusUpdate): # This should also be secure, but we'll leave it for now to keep it simple
-    # ... (function is the same)
+@app.post("/update-transaction-status")
+async def update_transaction_status(update_data: TransactionStatusUpdate):
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -184,19 +188,12 @@ async def update_transaction_status(update_data: TransactionStatusUpdate): # Thi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update transaction status: {e}")
 
-# CORRECTED: This is now a secure endpoint
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
     try:
-        # We now filter stats by the logged-in user
-        response = await supabase.from_("transactions") \
-            .select("amount, status") \
-            .eq("user_id", user_id) \
-            .gte("created_at", twenty_four_hours_ago.isoformat()) \
-            .execute()
-        # ... (rest of function is the same)
+        response = await supabase.from_("transactions").select("amount, status").eq("user_id", user_id).gte("created_at", twenty_four_hours_ago.isoformat()).execute()
         if not response.data:
             return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
         transactions = response.data
@@ -209,13 +206,15 @@ async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_
         print(f"Error fetching dashboard stats: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
 
-# CORRECTED: This is now a secure endpoint
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
-async def get_transactions(page: int = 1, page_size: int = 10, current_user: Annotated[dict, Depends(get_current_user)]):
+async def get_transactions(
+    current_user: Annotated[dict, Depends(get_current_user)], # CORRECTED: Moved this parameter first
+    page: int = 1, 
+    page_size: int = 10
+):
     user_id = current_user.id
     try:
         offset = (page - 1) * page_size
-        # We now filter the transaction list by the logged-in user
         response = await supabase.from_("transactions") \
             .select("id, created_at, amount, currency, geo, status", count='exact') \
             .eq("user_id", user_id) \
