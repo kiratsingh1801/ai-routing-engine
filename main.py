@@ -134,6 +134,7 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 
 # --- Helper Functions ---
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
+    # CORRECTED: Removed dependency on the old 'strategy' field
     strategy_instruction = f"""Your goal is to score the PSP based on a weighted average of its performance metrics. The weights determine the importance of each factor. The current weights are:
 - Success Rate: {ai_config.get('success_rate_weight', 0.5) * 100}%
 - Cost (lower is better): {ai_config.get('cost_weight', 0.3) * 100}%
@@ -221,10 +222,14 @@ async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_us
 
 @app.put("/admin/ai-config", response_model=AiConfig)
 async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).select("*").single().execute()
-    if not response.data:
-        raise HTTPException(status_code=500, detail="Failed to update AI config.")
-    return response.data
+    try:
+        response = await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).select("*").single().execute()
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Failed to update AI config.")
+        return response.data
+    except Exception as e:
+        print(f"Error updating AI config: {e}")
+        raise HTTPException(status_code=500, detail="An internal error occurred while updating AI config.")
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
