@@ -20,7 +20,6 @@ class Transaction(BaseModel):
     country: str = Field(..., alias='geo', example="US")
     card_bin: Optional[str] = Field(None, example="424242")
     payment_method: Optional[str] = Field(None, example="credit_card")
-    strategy: Literal["BALANCED", "MAX_SUCCESS", "MIN_COST"] = "BALANCED"
 
 class TransactionStatusUpdate(BaseModel):
     transaction_id: uuid.UUID
@@ -79,13 +78,10 @@ class PspCreate(PspBase):
 class Psp(PspBase):
     id: uuid.UUID
 
-class AIModelConfig(BaseModel):
-    strategy: str
+class AiConfig(BaseModel):
     success_rate_weight: float
     cost_weight: float
     speed_weight: float
-    risk_weight: float
-
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -95,7 +91,10 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
-origins = ["*"]
+origins = [
+    "http://localhost:5173",
+    "https://ai-routing-v2.vercel.app",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -108,7 +107,7 @@ app.add_middleware(
 # --- Supabase and Gemini Config ---
 supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- End of Config ---
 
 # --- Authentication Dependencies ---
@@ -131,41 +130,28 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
     if response.data and response.data.get("role") == "admin":
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
-
 # --- End of Authentication ---
 
 # --- Helper Functions ---
-async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
-    config_response = await supabase.from_("ai_model_config").select("*").eq("strategy", transaction.strategy).single().execute()
-    if not config_response.data:
-        weights = {'success_rate_weight': 0.4, 'cost_weight': 0.3, 'speed_weight': 0.2, 'risk_weight': 0.1}
-        strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
-    else:
-        weights = config_response.data
-        if transaction.strategy == "MAX_SUCCESS":
-            strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction."
-        elif transaction.strategy == "MIN_COST":
-            strategy_instruction = "Your primary goal is to minimize the cost of the transaction."
-        else: # BALANCED
-            strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
-
+async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
+    strategy_instruction = f"""Your goal is to score the PSP based on a weighted average of its performance metrics. The weights determine the importance of each factor. The current weights are:
+- Success Rate: {ai_config.get('success_rate_weight', 0.5) * 100}%
+- Cost (lower is better): {ai_config.get('cost_weight', 0.3) * 100}%
+- Speed (higher is better): {ai_config.get('speed_weight', 0.2) * 100}%
+Analyze the PSP's data against the transaction details and these weights to generate a score from 0 to 100."""
+    
     transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
     if transaction.payment_method:
         transaction_details += f"\n    * Payment Method: {transaction.payment_method}"
     if transaction.card_bin:
         transaction_details += f"\n    * Card BIN: {transaction.card_bin}"
-
+    
     historical_insights = ""
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
-
+        
     prompt = f"""You are a world-class Payment Routing Analyst.
 **Your Guiding Strategy:** {strategy_instruction}
-**Factor Weights (Importance):**
-* Success Rate: {weights['success_rate_weight'] * 100:.0f}%
-* Low Cost: {weights['cost_weight'] * 100:.0f}%
-* High Speed: {weights['speed_weight'] * 100:.0f}%
-* Low Risk: {weights['risk_weight'] * 100:.0f}%
 **Transaction Details:**
     {transaction_details}
 **PSP Performance Data:**
@@ -176,10 +162,10 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
 * Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
 **Live Historical Insights:**
 {historical_insights if historical_insights else "No recent transaction history for this specific route."}
-IMPORTANT: Based on the factor weights and all data provided, score this PSP from 0 to 100 for this specific transaction. Respond ONLY with a valid JSON object of the following structure:
+IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
 {{
 "score": <your_score_here_0_to_100>,
-"reason": "<your_brief_reason_here>"
+"reason": "<your_reason_here>"
 }}"""
     try:
         ai_response = await gemini_model.generate_content_async(prompt)
@@ -226,34 +212,19 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
         raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
 
-# RENAMED ENDPOINT
-@app.get("/admin/ai-settings", response_model=List[AIModelConfig])
-async def get_ai_settings(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    try:
-        response = await supabase.from_("ai_model_config").select("*").execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An exception occurred: {str(e)}")
+@app.get("/admin/ai-config", response_model=AiConfig)
+async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("ai_config").select("success_rate_weight, cost_weight, speed_weight").eq("id", 1).single().execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="AI config not found.")
+    return response.data
 
-# RENAMED ENDPOINT
-@app.put("/admin/ai-settings", response_model=List[AIModelConfig])
-async def update_ai_settings(configs: List[AIModelConfig], admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    updated_configs = []
-    try:
-        for config in configs:
-            response = await supabase.from_("ai_model_config") \
-                .update(config.model_dump(exclude={"strategy"})) \
-                .eq("strategy", config.strategy) \
-                .select("*") \
-                .single() \
-                .execute()
-            if response.data:
-                updated_configs.append(response.data)
-        if len(updated_configs) != len(configs):
-             raise HTTPException(status_code=404, detail="One or more strategies not found or failed to update.")
-        return updated_configs
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating AI configs: {e}")
+@app.put("/admin/ai-config", response_model=AiConfig)
+async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).select("*").single().execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to update AI config.")
+    return response.data
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
@@ -270,13 +241,19 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
     new_key = f"sk_{secrets.token_urlsafe(24)}"
     response = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).select("*").single().execute()
     if not response.data:
+         print(f"Supabase error during key generation: {response.error}")
          raise HTTPException(status_code=500, detail="Could not update API key in database.")
     return ApiKeyResponse(api_key=new_key)
 
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(transaction: Transaction, current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
-
+    
+    config_response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
+    if not config_response.data:
+        raise HTTPException(status_code=500, detail="AI configuration not found.")
+    ai_config = config_response.data
+    
     await supabase.from_("transactions").upsert({
         "id": str(transaction.transaction_id),
         "user_id": user_id,
@@ -285,12 +262,12 @@ async def route_transaction(transaction: Transaction, current_user: Annotated[di
         "geo": transaction.country,
         "payment_method": transaction.payment_method,
     }).execute()
-
+    
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     active_psps = psps_response.data
     if not active_psps:
         raise HTTPException(status_code=404, detail="No active PSPs found.")
-
+    
     psp_ids = [psp['id'] for psp in active_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
@@ -306,30 +283,30 @@ async def route_transaction(transaction: Transaction, current_user: Annotated[di
         total_attempts = successes + failures
         if total_attempts > 0:
             live_psp_stats[psp_id] = successes / total_attempts
-
-    tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id'))) for psp in active_psps]
+    
+    tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in active_psps]
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
     if not all_scores:
         raise HTTPException(status_code=500, detail="Could not score any PSPs.")
-
+    
     sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
     top_psps = sorted_psps[:3]
     ranked_response_list = [RankedPsp(rank=i + 1, **psp) for i, psp in enumerate(top_psps)]
-
+    
     if ranked_response_list:
         top_ranked_psp = ranked_response_list[0]
         await supabase.from_("transactions").update({"routed_psp_id": top_ranked_psp.psp_id, "status": "routed (AI choice)"}).eq("id", str(transaction.transaction_id)).execute()
-
+        
     return RoutingResponse(ranked_psps=ranked_response_list)
 
 @app.post("/update-transaction-status")
-async def update_transaction_status(update_data: TransactionStatusUpdate, current_user: Annotated[dict, Depends(get_current_user)]):
+async def update_transaction_status(update_data: TransactionStatusUpdate):
     try:
-        response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).select("*").single().execute()
+        response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Transaction with ID {update_data.transaction_id} not found.")
-        return {"status": "success", "transaction_id": update_data.transaction_id}
+        return update_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update transaction status: {e}")
 
@@ -341,13 +318,13 @@ async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_
         response = await supabase.from_("transactions").select("amount, status").eq("user_id", user_id).gte("created_at", twenty_four_hours_ago.isoformat()).execute()
         if not response.data:
             return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
-
+        
         transactions = response.data
         total_volume = sum(t['amount'] for t in transactions if t.get('amount'))
         total_transactions = len(transactions)
         completed_transactions = len([t for t in transactions if t.get('status') and t.get('status').lower() == 'completed'])
         success_rate = (completed_transactions / total_transactions * 100) if total_transactions > 0 else 0
-
+        
         return DashboardStats(total_volume_24h=total_volume, total_transactions_24h=total_transactions, success_rate_24h=success_rate, avg_speed="1.2s")
     except Exception as e:
         print(f"Error fetching dashboard stats: {e}")
@@ -356,8 +333,9 @@ async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
 async def get_transactions(
     current_user: Annotated[dict, Depends(get_current_user)],
-    page: int = 1,
-    page_size: int = 10):
+    page: int = 1, 
+    page_size: int = 10
+):
     user_id = current_user.id
     try:
         offset = (page - 1) * page_size
@@ -367,10 +345,10 @@ async def get_transactions(
             .order("created_at", desc=True) \
             .range(offset, offset + page_size - 1) \
             .execute()
-
+        
         transactions_data = response.data or []
         total_count = response.count or 0
-
+        
         return PaginatedTransactionsResponse(
             transactions=transactions_data,
             total_count=total_count,
