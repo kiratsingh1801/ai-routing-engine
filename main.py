@@ -241,29 +241,31 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
     return response.data
 
 # NEW: AI Model Configuration Endpoints
+# REVISED Admin Endpoint for AI Model Configuration
 @app.get("/admin/ai-config", response_model=List[AIModelConfig])
 async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("ai_model_config").select("strategy, success_rate_weight, cost_weight, speed_weight, risk_weight").execute()
-    return response.data
-
-@app.put("/admin/ai-config", response_model=List[AIModelConfig])
-async def update_ai_config(configs: List[AIModelConfig], admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    updated_configs = []
+    print("--- [DEBUG] Entering get_ai_config endpoint ---")
     try:
-        for config in configs:
-            response = await supabase.from_("ai_model_config") \
-                .update(config.model_dump(exclude={"strategy"})) \
-                .eq("strategy", config.strategy) \
-                .select("*") \
-                .single() \
-                .execute()
-            if response.data:
-                updated_configs.append(response.data)
-        if len(updated_configs) != len(configs):
-             raise HTTPException(status_code=404, detail="One or more strategies not found or failed to update.")
-        return updated_configs
+        print("[DEBUG] Attempting to query 'ai_model_config' table...")
+        response = await supabase.from_("ai_model_config").select(
+            "strategy, success_rate_weight, cost_weight, speed_weight, risk_weight"
+        ).execute()
+        
+        # This will print the raw response object to the logs
+        print(f"[DEBUG] Supabase raw response object: {response}")
+
+        if not response.data:
+            print("[DEBUG] Query returned no data. This might be unexpected. Returning empty list.")
+            return []
+        
+        print(f"[DEBUG] Supabase query successful. Data received: {response.data}")
+        print("[DEBUG] Data received. FastAPI will now serialize and return the response.")
+        return response.data
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating AI configs: {e}")
+        print(f"--- [FATAL ERROR] An exception occurred in get_ai_config: {str(e)} ---")
+        # This ensures we send a JSON error back if we catch an exception
+        raise HTTPException(status_code=500, detail=f"An unhandled exception occurred: {str(e)}")
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
