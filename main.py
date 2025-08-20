@@ -29,7 +29,7 @@ class RankedPsp(BaseModel):
     rank: int
     psp_id: str
     psp_name: str
-    score: int
+    score: float # CORRECTED: Changed from int to float
     reason: str
 
 class RoutingResponse(BaseModel):
@@ -222,8 +222,6 @@ async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_us
 @app.put("/admin/ai-config", response_model=AiConfig)
 async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     try:
-        # CORRECTED: The .select() method cannot be chained after .update() this way.
-        # We perform the update and then select the data to return it.
         await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).execute()
         response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
         
