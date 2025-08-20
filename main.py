@@ -97,10 +97,9 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
-origins = [
-    "http://localhost:5173",
-    "https://ai-routing-v2.vercel.app",
-]
+# Allow all origins for broader compatibility, especially with Vercel preview URLs.
+origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
