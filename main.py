@@ -131,23 +131,36 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
 
-async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-API-Key header missing")
-    
-    profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
-    if not profile_response.data:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    
-    user_id = profile_response.data['id']
-    
-    try:
-        user_response = await supabase.auth.admin.get_user_by_id(user_id)
-        if user_response.user:
-            return user_response.user
-        raise HTTPException(status_code=404, detail="User not found for this API key")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not retrieve user from API key")
+# A single, unified dependency for API calls
+async def get_user_from_token_or_key(
+    authorization: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None
+):
+    # Priority 1: Check for JWT (from frontend dashboard)
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        try:
+            user_response = await supabase.auth.get_user(jwt=token)
+            if user_response.user:
+                return user_response.user
+        except Exception:
+            # If JWT is invalid, fall through to check API key
+            pass
+
+    # Priority 2: Check for API Key (from merchant server)
+    if x_api_key:
+        profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
+        if profile_response.data:
+            user_id = profile_response.data['id']
+            try:
+                user_response = await supabase.auth.admin.get_user_by_id(user_id)
+                if user_response.user:
+                    return user_response.user
+            except Exception:
+                raise HTTPException(status_code=500, detail="Could not retrieve user from API key")
+
+    # If neither method works, deny access
+    raise HTTPException(status_code=401, detail="Invalid or missing credentials")
 # --- End of Authentication ---
 
 # --- Helper Functions ---
@@ -168,7 +181,23 @@ Analyze the PSP's data against the transaction details and these weights to gene
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
         
-    prompt = f"""You are a world-class Payment Routing Analyst... (rest of prompt is the same)"""
+    prompt = f"""You are a world-class Payment Routing Analyst.
+**Your Guiding Strategy:** {strategy_instruction}
+**Transaction Details:**
+    {transaction_details}
+**PSP Performance Data:**
+* Name: {psp.get('name')}
+* Overall Success Rate: {psp.get('success_rate') * 100:.1f}%
+* Fee: {psp.get('fee_percent')}%
+* Speed Score (0 to 1): {psp.get('speed_score')}
+* Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
+**Live Historical Insights:**
+{historical_insights if historical_insights else "No recent transaction history for this specific route."}
+IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
+{{
+"score": <your_score_here_0_to_100>,
+"reason": "<your_reason_here>"
+}}"""
     try:
         ai_response = await gemini_model.generate_content_async(prompt)
         cleaned_response_text = ai_response.text.strip().replace("```json", "").replace("```", "")
@@ -187,9 +216,13 @@ def read_root():
 # --- Admin Endpoints ---
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.auth.admin.list_users()
-    if hasattr(response, 'users'): return response.users
-    return response
+    try:
+        response = await supabase.auth.admin.list_users()
+        if hasattr(response, 'users'):
+            return response.users
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
@@ -199,19 +232,22 @@ async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_use
 @app.post("/admin/psps", response_model=Psp)
 async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("psps").insert(psp.model_dump()).select("*").single().execute()
-    if not response.data: raise HTTPException(status_code=500, detail="Failed to create PSP.")
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to create PSP.")
     return response.data
 
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
 async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).select("*").single().execute()
-    if not response.data: raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
+    if not response.data:
+        raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
 
 @app.get("/admin/ai-config", response_model=AiConfig)
 async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("ai_config").select("success_rate_weight, cost_weight, speed_weight").eq("id", 1).single().execute()
-    if not response.data: raise HTTPException(status_code=404, detail="AI config not found.")
+    if not response.data:
+        raise HTTPException(status_code=404, detail="AI config not found.")
     return response.data
 
 @app.put("/admin/ai-config", response_model=AiConfig)
@@ -219,7 +255,8 @@ async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends
     try:
         await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).execute()
         response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
-        if not response.data: raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
         return response.data
     except Exception as e:
         print(f"Error updating AI config: {e}")
@@ -238,26 +275,17 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
-    # CORRECTED: The .select() method cannot be chained after .update() this way.
-    # We perform the update and then select the data to return it.
     await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
-    
     if not response.data:
-         print(f"Supabase error during key generation: {response.error}")
          raise HTTPException(status_code=500, detail="Could not update or find API key after generation.")
     return ApiKeyResponse(api_key=new_key)
 
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(
     transaction: Transaction,
-    user_from_jwt: Annotated[dict | None, Depends(get_current_user)] = None,
-    user_from_api_key: Annotated[dict | None, Depends(get_user_from_api_key)] = None
+    current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
 ):
-    current_user = user_from_jwt or user_from_api_key
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
     user_id = current_user.id
     
     config_response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
@@ -266,8 +294,12 @@ async def route_transaction(
     ai_config = config_response.data
     
     await supabase.from_("transactions").upsert({
-        "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
-        "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
+        "id": str(transaction.transaction_id),
+        "user_id": user_id,
+        "amount": transaction.amount,
+        "currency": transaction.currency,
+        "geo": transaction.country,
+        "payment_method": transaction.payment_method,
     }).execute()
     
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
