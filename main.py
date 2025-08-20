@@ -168,9 +168,13 @@ def read_root():
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     try:
-        # This uses the service_role key to get a list of all users
         response = await supabase.auth.admin.list_users()
-        return response.users
+        # The supabase-py v2 library returns an object with a .users attribute.
+        # If an older version returned a list, the error was correct.
+        # To be robust, let's check the type.
+        if hasattr(response, 'users'):
+            return response.users
+        return response # Assume it's the list itself
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
