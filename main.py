@@ -266,6 +266,11 @@ async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_us
         print(f"--- [FATAL ERROR] An exception occurred in get_ai_config: {str(e)} ---")
         # This ensures we send a JSON error back if we catch an exception
         raise HTTPException(status_code=500, detail=f"An unhandled exception occurred: {str(e)}")
+# NEW DEBUGGING ENDPOINT
+@app.get("/admin/test-debug")
+async def run_debug_test(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    print("--- [SUCCESS] The /admin/test-debug endpoint was reached successfully! ---")
+    return {"status": "success", "message": "The test endpoint is working."}
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
