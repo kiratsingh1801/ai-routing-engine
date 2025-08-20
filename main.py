@@ -77,7 +77,7 @@ class PspCreate(PspBase):
     pass
 
 class Psp(PspBase):
-    id: int
+    id: uuid.UUID
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -202,8 +202,8 @@ async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_cur
     return response.data
 
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
-async def update_psp(psp_id: int, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", psp_id).select("*").single().execute()
+async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).select("*").single().execute()
     if not response.data:
         raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
