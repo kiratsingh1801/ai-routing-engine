@@ -1,5 +1,4 @@
 # main.py
-
 import config
 import google.generativeai as genai
 import json
@@ -80,7 +79,6 @@ class PspCreate(PspBase):
 class Psp(PspBase):
     id: uuid.UUID
 
-# NEW: Pydantic models for AI Model Configuration
 class AIModelConfig(BaseModel):
     strategy: str
     success_rate_weight: float
@@ -97,9 +95,7 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
-# Allow all origins for broader compatibility, especially with Vercel preview URLs.
 origins = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -140,10 +136,8 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 
 # --- Helper Functions ---
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
-    # MODIFIED: Fetch dynamic weights from the database
     config_response = await supabase.from_("ai_model_config").select("*").eq("strategy", transaction.strategy).single().execute()
     if not config_response.data:
-        # Fallback to a default in case the config is missing
         weights = {'success_rate_weight': 0.4, 'cost_weight': 0.3, 'speed_weight': 0.2, 'risk_weight': 0.1}
         strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     else:
@@ -165,30 +159,23 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
         
-    # MODIFIED: The prompt now includes the dynamic weights
     prompt = f"""You are a world-class Payment Routing Analyst.
-
 **Your Guiding Strategy:** {strategy_instruction}
-
 **Factor Weights (Importance):**
 * Success Rate: {weights['success_rate_weight'] * 100:.0f}%
 * Low Cost: {weights['cost_weight'] * 100:.0f}%
 * High Speed: {weights['speed_weight'] * 100:.0f}%
 * Low Risk: {weights['risk_weight'] * 100:.0f}%
-
 **Transaction Details:**
     {transaction_details}
-
 **PSP Performance Data:**
 * Name: {psp.get('name')}
 * Overall Success Rate: {psp.get('success_rate') * 100:.1f}%
 * Fee: {psp.get('fee_percent')}%
 * Speed Score (0 to 1): {psp.get('speed_score')}
 * Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
-
 **Live Historical Insights:**
-{historical_insights if historical_insights else "No recent transaction history for this specific route."}
-
+{historical_insighs if historical_insights else "No recent transaction history for this specific route."}
 IMPORTANT: Based on the factor weights and all data provided, score this PSP from 0 to 100 for this specific transaction. Respond ONLY with a valid JSON object of the following structure:
 {{
 "score": <your_score_here_0_to_100>,
@@ -202,7 +189,6 @@ IMPORTANT: Based on the factor weights and all data provided, score this PSP fro
     except Exception as e:
         print(f"Error scoring PSP {psp.get('name')}: {e}")
         return None
-
 # --- End of Helper Functions ---
 
 # --- API Endpoints ---
@@ -240,37 +226,32 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
         raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
 
-# NEW: AI Model Configuration Endpoints
-# REVISED Admin Endpoint for AI Model Configuration
 @app.get("/admin/ai-config", response_model=List[AIModelConfig])
 async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    print("--- [DEBUG] Entering get_ai_config endpoint ---")
     try:
-        print("[DEBUG] Attempting to query 'ai_model_config' table...")
-        response = await supabase.from_("ai_model_config").select(
-            "strategy, success_rate_weight, cost_weight, speed_weight, risk_weight"
-        ).execute()
-        
-        # This will print the raw response object to the logs
-        print(f"[DEBUG] Supabase raw response object: {response}")
-
-        if not response.data:
-            print("[DEBUG] Query returned no data. This might be unexpected. Returning empty list.")
-            return []
-        
-        print(f"[DEBUG] Supabase query successful. Data received: {response.data}")
-        print("[DEBUG] Data received. FastAPI will now serialize and return the response.")
+        response = await supabase.from_("ai_model_config").select("*").execute()
         return response.data
-
     except Exception as e:
-        print(f"--- [FATAL ERROR] An exception occurred in get_ai_config: {str(e)} ---")
-        # This ensures we send a JSON error back if we catch an exception
-        raise HTTPException(status_code=500, detail=f"An unhandled exception occurred: {str(e)}")
-# NEW DEBUGGING ENDPOINT
-@app.get("/admin/test-debug")
-async def run_debug_test(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    print("--- [SUCCESS] The /admin/test-debug endpoint was reached successfully! ---")
-    return {"status": "success", "message": "The test endpoint is working."}
+        raise HTTPException(status_code=500, detail=f"An exception occurred: {str(e)}")
+
+@app.put("/admin/ai-config", response_model=List[AIModelConfig])
+async def update_ai_config(configs: List[AIModelConfig], admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    updated_configs = []
+    try:
+        for config in configs:
+            response = await supabase.from_("ai_model_config") \
+                .update(config.model_dump(exclude={"strategy"})) \
+                .eq("strategy", config.strategy) \
+                .select("*") \
+                .single() \
+                .execute()
+            if response.data:
+                updated_configs.append(response.data)
+        if len(updated_configs) != len(configs):
+             raise HTTPException(status_code=404, detail="One or more strategies not found or failed to update.")
+        return updated_configs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating AI configs: {e}")
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
@@ -282,12 +263,11 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     return ApiKeyResponse(api_key=None)
 
 @app.post("/api-key/generate", response_model=ApiKeyResponse)
-async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
+async def generate_api_key(current_user: Annotated[dict, Depends(get_current_admin_user)]):
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
-    response = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
+    response = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).select("*").single().execute()
     if not response.data:
-         print(f"Supabase error during key generation: {response.error}")
          raise HTTPException(status_code=500, detail="Could not update API key in database.")
     return ApiKeyResponse(api_key=new_key)
 
@@ -342,12 +322,12 @@ async def route_transaction(transaction: Transaction, current_user: Annotated[di
     return RoutingResponse(ranked_psps=ranked_response_list)
 
 @app.post("/update-transaction-status")
-async def update_transaction_status(update_data: TransactionStatusUpdate):
+async def update_transaction_status(update_data: TransactionStatusUpdate, current_user: Annotated[dict, Depends(get_current_user)]):
     try:
-        response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
+        response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).select("*").single().execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Transaction with ID {update_data.transaction_id} not found.")
-        return update_data
+        return {"status": "success", "transaction_id": update_data.transaction_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update transaction status: {e}")
 
