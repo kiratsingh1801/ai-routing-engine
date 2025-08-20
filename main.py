@@ -1,4 +1,5 @@
 # main.py
+
 import config
 import google.generativeai as genai
 import json
@@ -78,6 +79,15 @@ class PspCreate(PspBase):
 
 class Psp(PspBase):
     id: uuid.UUID
+
+# NEW: Pydantic models for AI Model Configuration
+class AIModelConfig(BaseModel):
+    strategy: str
+    success_rate_weight: float
+    cost_weight: float
+    speed_weight: float
+    risk_weight: float
+
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -103,7 +113,7 @@ app.add_middleware(
 # --- Supabase and Gemini Config ---
 supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 # --- End of Config ---
 
 # --- Authentication Dependencies ---
@@ -126,15 +136,25 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
     if response.data and response.data.get("role") == "admin":
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
+
 # --- End of Authentication ---
 
 # --- Helper Functions ---
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float]) -> Optional[dict]:
-    strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
-    if transaction.strategy == "MAX_SUCCESS":
-        strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction."
-    elif transaction.strategy == "MIN_COST":
-        strategy_instruction = "Your primary goal is to minimize the cost of the transaction."
+    # MODIFIED: Fetch dynamic weights from the database
+    config_response = await supabase.from_("ai_model_config").select("*").eq("strategy", transaction.strategy).single().execute()
+    if not config_response.data:
+        # Fallback to a default in case the config is missing
+        weights = {'success_rate_weight': 0.4, 'cost_weight': 0.3, 'speed_weight': 0.2, 'risk_weight': 0.1}
+        strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
+    else:
+        weights = config_response.data
+        if transaction.strategy == "MAX_SUCCESS":
+            strategy_instruction = "Your primary goal is to maximize the chance of a successful transaction."
+        elif transaction.strategy == "MIN_COST":
+            strategy_instruction = "Your primary goal is to minimize the cost of the transaction."
+        else: # BALANCED
+            strategy_instruction = "Your goal is to balance success rate, cost, and speed to provide the best overall value."
     
     transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
     if transaction.payment_method:
@@ -146,22 +166,34 @@ async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: 
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
         
+    # MODIFIED: The prompt now includes the dynamic weights
     prompt = f"""You are a world-class Payment Routing Analyst.
+
 **Your Guiding Strategy:** {strategy_instruction}
+
+**Factor Weights (Importance):**
+* Success Rate: {weights['success_rate_weight'] * 100:.0f}%
+* Low Cost: {weights['cost_weight'] * 100:.0f}%
+* High Speed: {weights['speed_weight'] * 100:.0f}%
+* Low Risk: {weights['risk_weight'] * 100:.0f}%
+
 **Transaction Details:**
     {transaction_details}
+
 **PSP Performance Data:**
 * Name: {psp.get('name')}
 * Overall Success Rate: {psp.get('success_rate') * 100:.1f}%
 * Fee: {psp.get('fee_percent')}%
 * Speed Score (0 to 1): {psp.get('speed_score')}
 * Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
+
 **Live Historical Insights:**
 {historical_insights if historical_insights else "No recent transaction history for this specific route."}
-IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
+
+IMPORTANT: Based on the factor weights and all data provided, score this PSP from 0 to 100 for this specific transaction. Respond ONLY with a valid JSON object of the following structure:
 {{
 "score": <your_score_here_0_to_100>,
-"reason": "<your_reason_here>"
+"reason": "<your_brief_reason_here>"
 }}"""
     try:
         ai_response = await gemini_model.generate_content_async(prompt)
@@ -171,6 +203,7 @@ IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
     except Exception as e:
         print(f"Error scoring PSP {psp.get('name')}: {e}")
         return None
+
 # --- End of Helper Functions ---
 
 # --- API Endpoints ---
@@ -207,6 +240,31 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
     if not response.data:
         raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
+
+# NEW: AI Model Configuration Endpoints
+@app.get("/admin/ai-config", response_model=List[AIModelConfig])
+async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("ai_model_config").select("strategy, success_rate_weight, cost_weight, speed_weight, risk_weight").execute()
+    return response.data
+
+@app.put("/admin/ai-config", response_model=List[AIModelConfig])
+async def update_ai_config(configs: List[AIModelConfig], admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    updated_configs = []
+    try:
+        for config in configs:
+            response = await supabase.from_("ai_model_config") \
+                .update(config.model_dump(exclude={"strategy"})) \
+                .eq("strategy", config.strategy) \
+                .select("*") \
+                .single() \
+                .execute()
+            if response.data:
+                updated_configs.append(response.data)
+        if len(updated_configs) != len(configs):
+             raise HTTPException(status_code=404, detail="One or more strategies not found or failed to update.")
+        return updated_configs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating AI configs: {e}")
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
@@ -311,8 +369,7 @@ async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_
 async def get_transactions(
     current_user: Annotated[dict, Depends(get_current_user)],
     page: int = 1, 
-    page_size: int = 10
-):
+    page_size: int = 10):
     user_id = current_user.id
     try:
         offset = (page - 1) * page_size
