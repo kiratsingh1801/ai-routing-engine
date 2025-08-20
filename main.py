@@ -238,10 +238,14 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
-    response = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).select("*").single().execute()
+    # CORRECTED: The .select() method cannot be chained after .update() this way.
+    # We perform the update and then select the data to return it.
+    await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
+    response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
+    
     if not response.data:
          print(f"Supabase error during key generation: {response.error}")
-         raise HTTPException(status_code=500, detail="Could not update API key in database.")
+         raise HTTPException(status_code=500, detail="Could not update or find API key after generation.")
     return ApiKeyResponse(api_key=new_key)
 
 @app.post("/route-transaction", response_model=RoutingResponse)
