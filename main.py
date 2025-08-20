@@ -24,7 +24,7 @@ class Transaction(BaseModel):
 
 class TransactionStatusUpdate(BaseModel):
     transaction_id: uuid.UUID
-    status: str = Field(..., example="completed")
+    status: str
 
 class RankedPsp(BaseModel):
     rank: int
@@ -64,6 +64,20 @@ class AdminUser(BaseModel):
     email: Optional[str] = None
     created_at: datetime
     last_sign_in_at: Optional[datetime] = None
+
+class PspBase(BaseModel):
+    name: str
+    success_rate: float
+    fee_percent: float
+    speed_score: float
+    risk_score: float
+    is_active: bool = True
+
+class PspCreate(PspBase):
+    pass
+
+class Psp(PspBase):
+    id: int
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -169,14 +183,30 @@ def read_root():
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     try:
         response = await supabase.auth.admin.list_users()
-        # The supabase-py v2 library returns an object with a .users attribute.
-        # If an older version returned a list, the error was correct.
-        # To be robust, let's check the type.
         if hasattr(response, 'users'):
             return response.users
-        return response # Assume it's the list itself
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/psps", response_model=List[Psp])
+async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("psps").select("*").order("id").execute()
+    return response.data
+
+@app.post("/admin/psps", response_model=Psp)
+async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("psps").insert(psp.model_dump()).select("*").single().execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to create PSP.")
+    return response.data
+
+@app.put("/admin/psps/{psp_id}", response_model=Psp)
+async def update_psp(psp_id: int, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("psps").update(psp.model_dump()).eq("id", psp_id).select("*").single().execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
+    return response.data
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
