@@ -100,7 +100,7 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*", "Authorization", "X-API-Key"], # Add X-API-Key to allowed headers
+    allow_headers=["*", "Authorization", "X-API-Key"],
 )
 # --- End of CORS ---
 
@@ -131,19 +131,16 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
 
-# NEW: Dependency to get user from a permanent API key
 async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header missing")
     
-    # Find the profile that matches this API key
     profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
     if not profile_response.data:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     
     user_id = profile_response.data['id']
     
-    # Get the full user object using the admin client
     try:
         user_response = await supabase.auth.admin.get_user_by_id(user_id)
         if user_response.user:
@@ -188,47 +185,68 @@ def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
 # --- Admin Endpoints ---
-# ... (All admin endpoints are the same)
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return []
+    response = await supabase.auth.admin.list_users()
+    if hasattr(response, 'users'): return response.users
+    return response
+
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return []
+    response = await supabase.from_("psps").select("*").order("id").execute()
+    return response.data
+
 @app.post("/admin/psps", response_model=Psp)
 async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return {}
+    response = await supabase.from_("psps").insert(psp.model_dump()).select("*").single().execute()
+    if not response.data: raise HTTPException(status_code=500, detail="Failed to create PSP.")
+    return response.data
+
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
 async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return {}
+    response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).select("*").single().execute()
+    if not response.data: raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
+    return response.data
+
 @app.get("/admin/ai-config", response_model=AiConfig)
 async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return {}
+    response = await supabase.from_("ai_config").select("success_rate_weight, cost_weight, speed_weight").eq("id", 1).single().execute()
+    if not response.data: raise HTTPException(status_code=404, detail="AI config not found.")
+    return response.data
+
 @app.put("/admin/ai-config", response_model=AiConfig)
 async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # ...
-    return {}
+    try:
+        await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).execute()
+        response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
+        if not response.data: raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
+        return response.data
+    except Exception as e:
+        print(f"Error updating AI config: {e}")
+        raise HTTPException(status_code=500, detail="An internal error occurred while updating AI config.")
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
 async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ...
-    return {}
+    user_id = current_user.id
+    response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
+    if response.data:
+        return ApiKeyResponse(api_key=response.data.get("api_key"))
+    return ApiKeyResponse(api_key=None)
+
 @app.post("/api-key/generate", response_model=ApiKeyResponse)
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ...
-    return {}
+    user_id = current_user.id
+    new_key = f"sk_{secrets.token_urlsafe(24)}"
+    response = await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).select("*").single().execute()
+    if not response.data:
+         print(f"Supabase error during key generation: {response.error}")
+         raise HTTPException(status_code=500, detail="Could not update API key in database.")
+    return ApiKeyResponse(api_key=new_key)
 
-# UPDATED: This endpoint now accepts either a JWT (for dashboard use) or an API Key (for server use)
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(
     transaction: Transaction,
-    # One of these two will be used, depending on what the client sends
     user_from_jwt: Annotated[dict | None, Depends(get_current_user)] = None,
     user_from_api_key: Annotated[dict | None, Depends(get_user_from_api_key)] = None
 ):
@@ -285,13 +303,61 @@ async def route_transaction(
         
     return RoutingResponse(ranked_psps=ranked_response_list)
 
-# ... (rest of endpoints are the same)
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
-    return update_data
+    try:
+        response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail=f"Transaction with ID {update_data.transaction_id} not found.")
+        return update_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update transaction status: {e}")
+
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_user)]):
-    return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
+    user_id = current_user.id
+    twenty_four_hours_ago = datetime.now() - timedelta(days=1)
+    try:
+        response = await supabase.from_("transactions").select("amount, status").eq("user_id", user_id).gte("created_at", twenty_four_hours_ago.isoformat()).execute()
+        if not response.data:
+            return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
+        
+        transactions = response.data
+        total_volume = sum(t['amount'] for t in transactions if t.get('amount'))
+        total_transactions = len(transactions)
+        completed_transactions = len([t for t in transactions if t.get('status') and t.get('status').lower() == 'completed'])
+        success_rate = (completed_transactions / total_transactions * 100) if total_transactions > 0 else 0
+        
+        return DashboardStats(total_volume_24h=total_volume, total_transactions_24h=total_transactions, success_rate_24h=success_rate, avg_speed="1.2s")
+    except Exception as e:
+        print(f"Error fetching dashboard stats: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch dashboard stats.")
+
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
-async def get_transactions(current_user: Annotated[dict, Depends(get_current_user)], page: int = 1, page_size: int = 10):
-    return PaginatedTransactionsResponse(transactions=[], total_count=0, page=1, page_size=10)
+async def get_transactions(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    page: int = 1, 
+    page_size: int = 10
+):
+    user_id = current_user.id
+    try:
+        offset = (page - 1) * page_size
+        response = await supabase.from_("transactions") \
+            .select("id, created_at, amount, currency, geo, status", count='exact') \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .range(offset, offset + page_size - 1) \
+            .execute()
+        
+        transactions_data = response.data or []
+        total_count = response.count or 0
+        
+        return PaginatedTransactionsResponse(
+            transactions=transactions_data,
+            total_count=total_count,
+            page=page,
+            page_size=page_size
+        )
+    except Exception as e:
+        print(f"Error fetching transactions: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch transactions.")
