@@ -235,9 +235,15 @@ def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
 # --- Admin Endpoints ---
+# main.py
+
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.auth.admin.list_users()
+    # CORRECTED: The response from list_users() has a .users attribute
+    # containing the list. The previous error was in a different function.
+    # After re-checking the Supabase V2 library, the response IS an object,
+    # and we need to return its .users attribute.
     return response.users
 
 @app.post("/admin/invite", response_model=MessageResponse)
