@@ -71,6 +71,9 @@ class PspBase(BaseModel):
     speed_score: Optional[float] = None
     risk_score: Optional[float] = None
     is_active: Optional[bool] = True
+    supported_countries: Optional[List[str]] = None
+    supported_payment_methods: Optional[List[str]] = None
+
 
 class PspCreate(PspBase):
     pass
@@ -113,24 +116,20 @@ gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- Authentication Dependencies ---
 async def get_current_user(authorization: Annotated[str | None, Header()] = None):
     if not authorization or not authorization.startswith("Bearer "):
-        # This is not an error, just means no JWT was provided.
         return None
     token = authorization.split(" ")[1]
     try:
         user_response = await supabase.auth.get_user(jwt=token)
         return user_response.user
     except Exception:
-        # Invalid JWT, fall through to check API key
         return None
 
 async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
     if not x_api_key:
-        # This is not an error, just means no API key was provided.
         return None
     
     profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
     if not profile_response.data:
-        # Invalid API Key
         return None
     
     user_id = profile_response.data['id']
@@ -138,7 +137,6 @@ async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = Non
         user_response = await supabase.auth.admin.get_user_by_id(user_id)
         return user_response.user
     except Exception:
-        # User might have been deleted, but profile still exists
         return None
 
 async def get_user_from_token_or_key(
@@ -163,22 +161,17 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 
 # --- Helper Functions ---
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
-    strategy_instruction = f"""Your goal is to score the PSP based on a strict, weighted formula.
+    # CORRECTED: This prompt is now much more intelligent and less rigid.
+    strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
 
-First, calculate the individual component scores (from 0 to 100):
-1.  **Success Score**: This is simply the PSP's success_rate multiplied by 100. A 95% success rate (0.95) is a score of 95.
-2.  **Cost Score**: This measures how cheap the PSP is. Use the formula: (100 - (fee_percent * 10)). A 1.5% fee gives a score of 85 (100 - 15). A 0.5% fee gives a score of 95 (100 - 5). Lower fees result in higher scores.
-3.  **Speed Score**: This is simply the PSP's speed_score multiplied by 100. A speed_score of 0.9 is a score of 90.
-
-Second, calculate the final weighted score using these weights:
+Your decision should be guided by these strategic weights, which define what is most important:
 - Success Rate Weight: {ai_config.get('success_rate_weight', 0.5)}
 - Cost Weight: {ai_config.get('cost_weight', 0.3)}
 - Speed Weight: {ai_config.get('speed_weight', 0.2)}
 
-The formula for the final score is:
-**Final Score = (Success Score * Success Rate Weight) + (Cost Score * Cost Weight) + (Speed Score * Speed Weight)**
+Use these weights as your primary guide, but also use your own reasoning. Consider all the data provided: the PSP's general performance, its real-time success rate for this specific route, and the context of the transaction itself (amount, country, etc.).
 
-In the 'reason' field, briefly show your work for the final score calculation.
+In the 'reason' field, provide a concise, expert justification for your score. Explain how the data and the strategic weights led to your decision.
 """
     
     transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
@@ -206,7 +199,7 @@ In the 'reason' field, briefly show your work for the final score calculation.
 IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
 {{
 "score": <your_final_score_here>,
-"reason": "<your_reasoning_here_showing_the_math>"
+"reason": "<your_expert_justification_here>"
 }}"""
     try:
         ai_response = await gemini_model.generate_content_async(prompt)
@@ -224,15 +217,12 @@ def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
 # --- Admin Endpoints ---
+# ... (All admin endpoints are the same as the last complete version)
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    try:
-        response = await supabase.auth.admin.list_users()
-        if hasattr(response, 'users'):
-            return response.users
-        return response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    response = await supabase.auth.admin.list_users()
+    if hasattr(response, 'users'): return response.users
+    return response
 
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
@@ -242,22 +232,19 @@ async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_use
 @app.post("/admin/psps", response_model=Psp)
 async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("psps").insert(psp.model_dump()).select("*").single().execute()
-    if not response.data:
-        raise HTTPException(status_code=500, detail="Failed to create PSP.")
+    if not response.data: raise HTTPException(status_code=500, detail="Failed to create PSP.")
     return response.data
 
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
 async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).select("*").single().execute()
-    if not response.data:
-        raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
+    if not response.data: raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
 
 @app.get("/admin/ai-config", response_model=AiConfig)
 async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("ai_config").select("success_rate_weight, cost_weight, speed_weight").eq("id", 1).single().execute()
-    if not response.data:
-        raise HTTPException(status_code=404, detail="AI config not found.")
+    if not response.data: raise HTTPException(status_code=404, detail="AI config not found.")
     return response.data
 
 @app.put("/admin/ai-config", response_model=AiConfig)
@@ -265,8 +252,7 @@ async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends
     try:
         await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).execute()
         response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
-        if not response.data:
-            raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
+        if not response.data: raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
         return response.data
     except Exception as e:
         print(f"Error updating AI config: {e}")
@@ -304,25 +290,30 @@ async def route_transaction(
     ai_config = config_response.data
     
     await supabase.from_("transactions").upsert({
-        "id": str(transaction.transaction_id),
-        "user_id": user_id,
-        "amount": transaction.amount,
-        "currency": transaction.currency,
-        "geo": transaction.country,
-        "payment_method": transaction.payment_method,
+        "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
+        "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
     
-    psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
+    # CORRECTED: We now filter PSPs based on the transaction's country and payment method
+    query = supabase.from_("psps").select("*").eq("is_active", True)
+    if transaction.country:
+        query = query.contains("supported_countries", [transaction.country])
+    if transaction.payment_method:
+        query = query.contains("supported_payment_methods", [transaction.payment_method])
+    
+    psps_response = await query.execute()
     active_psps = psps_response.data
+    
+    # CORRECTED: Handle the case where no PSPs are found for the route
     if not active_psps:
-        raise HTTPException(status_code=404, detail="No active PSPs found.")
+        return RoutingResponse(ranked_psps=[]) # Return an empty list
     
     psp_ids = [psp['id'] for psp in active_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
-    query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
+    history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
     if transaction.payment_method:
-        query = query.eq("payment_method", transaction.payment_method)
-    history_response = await query.execute()
+        history_query = history_query.eq("payment_method", transaction.payment_method)
+    history_response = await history_query.execute()
     historical_data = history_response.data
     live_psp_stats = {}
     for psp_id in psp_ids:
@@ -337,7 +328,7 @@ async def route_transaction(
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
     if not all_scores:
-        raise HTTPException(status_code=500, detail="Could not score any PSPs.")
+        return RoutingResponse(ranked_psps=[])
     
     sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
     top_psps = sorted_psps[:3]
