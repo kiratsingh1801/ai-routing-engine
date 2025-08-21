@@ -276,10 +276,19 @@ async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_cur
     if not response.data: raise HTTPException(status_code=500, detail="Failed to create PSP.")
     return response.data
 
+# main.py - Replace the old update_psp function
+
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
 async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).select("*").single().execute()
-    if not response.data: raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
+    # Step 1: Update the data. This part no longer returns the updated row.
+    await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).execute()
+
+    # Step 2: Fetch the newly updated data in a separate call.
+    response = await supabase.from_("psps").select("*").eq("id", str(psp_id)).single().execute()
+
+    if not response.data:
+        raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found after update.")
+
     return response.data
 
 @app.get("/admin/users/{user_id}/ai-config", response_model=AiConfig)
