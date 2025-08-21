@@ -258,7 +258,7 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
     if not response.data: raise HTTPException(status_code=404, detail=f"PSP with id {psp_id} not found.")
     return response.data
 
-@app.get("/admin/ai-config", response_model=AiConfig)
+@app.get("/admin/users/{user_id}/ai-config", response_model=AiConfig)
 async def get_user_ai_config(user_id: uuid.UUID, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("profiles").select("success_rate_weight, cost_weight, speed_weight").eq("id", user_id).single().execute()
     if not response.data:
@@ -302,7 +302,9 @@ async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_use
 @app.put("/merchant/ai-config", response_model=AiConfig)
 async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
-    response = await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).select("*").single().execute()
+    # CORRECTED: The .select() method cannot be chained after .update() this way.
+    await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
+    response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
         raise HTTPException(status_code=500, detail="Failed to update AI config.")
     return response.data
