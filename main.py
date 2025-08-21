@@ -20,6 +20,7 @@ class Transaction(BaseModel):
     country: str = Field(..., alias='geo', example="US")
     card_bin: Optional[str] = Field(None, example="424242")
     payment_method: Optional[str] = Field(None, example="credit_card")
+    transaction_type: Literal['payin', 'payout'] # New required field
 
 class TransactionStatusUpdate(BaseModel):
     transaction_id: uuid.UUID
@@ -66,8 +67,6 @@ class AdminUser(BaseModel):
 
 class PspBase(BaseModel):
     name: str
-    success_rate: Optional[float] = None
-    fee_percent: Optional[float] = None
     speed_score: Optional[float] = None
     risk_score: Optional[float] = None
     is_active: Optional[bool] = True
@@ -75,6 +74,12 @@ class PspBase(BaseModel):
     supported_payment_methods: Optional[List[str]] = None
     supported_currencies: Optional[List[str]] = None
     supported_card_brands: Optional[List[str]] = None
+    supported_services: Optional[List[str]] = None
+    payin_fee_percent: Optional[float] = None
+    payout_fee_percent: Optional[float] = None
+    payin_success_rate: Optional[float] = None
+    payout_success_rate: Optional[float] = None
+
 
 class PspCreate(PspBase):
     pass
@@ -185,6 +190,14 @@ Use these weights as your primary guide, but also use your own reasoning. Consid
 In the 'reason' field, provide a concise, expert justification for your score. Explain how the data and the strategic weights led to your decision.
 """
     
+    # Select the correct fee and success rate based on the transaction type
+    if transaction.transaction_type == 'payin':
+        fee_percent = psp.get('payin_fee_percent', 0)
+        success_rate = psp.get('payin_success_rate', 0)
+    else: # payout
+        fee_percent = psp.get('payout_fee_percent', 0)
+        success_rate = psp.get('payout_success_rate', 0)
+
     transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
     if transaction.payment_method:
         transaction_details += f"\n    * Payment Method: {transaction.payment_method}"
@@ -201,8 +214,8 @@ In the 'reason' field, provide a concise, expert justification for your score. E
     {transaction_details}
 **PSP Performance Data:**
 * Name: {psp.get('name')}
-* Overall Success Rate: {psp.get('success_rate')}
-* Fee: {psp.get('fee_percent')}%
+* Overall Success Rate for this transaction type: {success_rate * 100:.1f}%
+* Fee for this transaction type: {fee_percent}%
 * Speed Score (0 to 1): {psp.get('speed_score')}
 * Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
 **Live Historical Insights:**
@@ -316,12 +329,13 @@ async def route_transaction(
         country_ok = transaction.country in psp.get("supported_countries", [])
         currency_ok = transaction.currency in psp.get("supported_currencies", [])
         pm_ok = transaction.payment_method in psp.get("supported_payment_methods", [])
+        service_ok = transaction.transaction_type in psp.get("supported_services", [])
         
         card_brand_ok = True
         if transaction.payment_method == 'credit_card' and card_brand:
             card_brand_ok = card_brand in psp.get("supported_card_brands", [])
 
-        if country_ok and currency_ok and pm_ok and card_brand_ok:
+        if country_ok and currency_ok and pm_ok and card_brand_ok and service_ok:
             compatible_psps.append(psp)
 
     if not compatible_psps:
