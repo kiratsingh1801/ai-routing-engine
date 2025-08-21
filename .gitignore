@@ -1,12 +1,12 @@
 # Ignore the virtual environment folder
 venv/
 
-# Ignore our new secrets file
+# Ignore our secrets files
 secrets.py
+app_secrets.py
 
 # Ignore the problematic .env file if it exists
 .env
 
 # Ignore Python cache files
-__pycache__/app_secrets.py
 __pycache__/
