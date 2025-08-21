@@ -185,6 +185,7 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     profiles_map = {profile['id']: profile['role'] for profile in profiles_response.data}
     
     merged_users = []
+    # CORRECTED: The response from list_users() has a .users attribute
     for user in auth_response.users:
         user_dict = user.model_dump()
         user_dict['role'] = profiles_map.get(str(user.id))
@@ -237,14 +238,15 @@ async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_use
 
 @app.post("/admin/psps", response_model=Psp)
 async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    insert_response = await supabase.from_("psps").insert(psp.model_dump()).execute()
-    if not insert_response.data:
+    # CORRECTED: Use .select().single() after insert
+    response = await supabase.from_("psps").insert(psp.model_dump()).select().single().execute()
+    if not response.data:
         raise HTTPException(status_code=500, detail="Failed to create PSP.")
-    new_psp = insert_response.data[0]
-    return new_psp
+    return response.data
 
 @app.put("/admin/psps/{psp_id}", response_model=Psp)
 async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    # CORRECTED: Split update and select into two calls
     await supabase.from_("psps").update(psp.model_dump(exclude_unset=True)).eq("id", str(psp_id)).execute()
     response = await supabase.from_("psps").select("*").eq("id", str(psp_id)).single().execute()
     if not response.data:
@@ -260,6 +262,7 @@ async def get_user_ai_config(user_id: uuid.UUID, admin_user: Annotated[dict, Dep
 
 @app.put("/admin/users/{user_id}/ai-config", response_model=AiConfig)
 async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    # CORRECTED: Split update and select into two calls
     await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
@@ -279,6 +282,7 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
+    # CORRECTED: Split update and select into two calls
     await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
     if not response.data:
@@ -296,6 +300,7 @@ async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_use
 @app.put("/merchant/ai-config", response_model=AiConfig)
 async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
+    # CORRECTED: Split update and select into two calls
     await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
@@ -310,7 +315,6 @@ async def route_transaction(
     # This function is complex and not part of the current bug.
     # A placeholder response is returned to allow testing of other features.
     return RoutingResponse(ranked_psps=[])
-
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
