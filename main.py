@@ -195,7 +195,7 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     profiles_map = {profile['id']: profile['role'] for profile in profiles_response.data}
     
     merged_users = []
-    # CORRECTED: The response object itself has a .users attribute
+    # CORRECTED LOGIC IS HERE:
     for user in auth_response.users:
         user_dict = user.model_dump()
         user_dict['role'] = profiles_map.get(str(user.id))
