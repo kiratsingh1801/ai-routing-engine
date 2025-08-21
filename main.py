@@ -240,11 +240,20 @@ def read_root():
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     auth_response = await supabase.auth.admin.list_users()
     profiles_response = await supabase.from_("profiles").select("id, role").execute()
+    
     profiles_map = {profile['id']: profile['role'] for profile in profiles_response.data}
     
+    # --- ROBUST HANDLING ---
+    # This code checks the structure of the response and handles it correctly,
+    # preventing the 'list' object has no attribute 'users' crash.
+    user_list = []
+    if hasattr(auth_response, 'users'):
+        user_list = auth_response.users
+    else:
+        user_list = auth_response
+
     merged_users = []
-    # CORRECTED: The response object from list_users() has a .users attribute
-    for user in auth_response.users:
+    for user in user_list:
         user_dict = user.model_dump()
         user_dict['role'] = profiles_map.get(str(user.id))
         merged_users.append(AdminUser(**user_dict))
