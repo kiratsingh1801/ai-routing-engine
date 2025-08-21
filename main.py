@@ -20,7 +20,7 @@ class Transaction(BaseModel):
     country: str = Field(..., alias='geo', example="US")
     card_bin: Optional[str] = Field(None, example="424242")
     payment_method: Optional[str] = Field(None, example="credit_card")
-    transaction_type: Literal['payin', 'payout'] # New required field
+    transaction_type: Literal['payin', 'payout']
 
 class TransactionStatusUpdate(BaseModel):
     transaction_id: uuid.UUID
@@ -79,7 +79,6 @@ class PspBase(BaseModel):
     payout_fee_percent: Optional[float] = None
     payin_success_rate: Optional[float] = None
     payout_success_rate: Optional[float] = None
-
 
 class PspCreate(PspBase):
     pass
@@ -167,14 +166,10 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 
 # --- Helper Functions ---
 def get_card_brand_from_bin(card_bin: str) -> Optional[str]:
-    if not card_bin:
-        return None
-    if card_bin.startswith('4'):
-        return 'visa'
-    elif card_bin.startswith('5'):
-        return 'mastercard'
-    elif card_bin.startswith(('34', '37')):
-        return 'amex'
+    if not card_bin: return None
+    if card_bin.startswith('4'): return 'visa'
+    elif card_bin.startswith('5'): return 'mastercard'
+    elif card_bin.startswith(('34', '37')): return 'amex'
     return 'unknown'
 
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
@@ -190,7 +185,6 @@ Use these weights as your primary guide, but also use your own reasoning. Consid
 In the 'reason' field, provide a concise, expert justification for your score. Explain how the data and the strategic weights led to your decision.
 """
     
-    # Select the correct fee and success rate based on the transaction type
     if transaction.transaction_type == 'payin':
         fee_percent = psp.get('payin_fee_percent', 0)
         success_rate = psp.get('payin_success_rate', 0)
@@ -265,21 +259,18 @@ async def update_psp(psp_id: uuid.UUID, psp: PspBase, admin_user: Annotated[dict
     return response.data
 
 @app.get("/admin/ai-config", response_model=AiConfig)
-async def get_ai_config(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("ai_config").select("success_rate_weight, cost_weight, speed_weight").eq("id", 1).single().execute()
-    if not response.data: raise HTTPException(status_code=404, detail="AI config not found.")
+async def get_user_ai_config(user_id: uuid.UUID, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("profiles").select("success_rate_weight, cost_weight, speed_weight").eq("id", user_id).single().execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail=f"AI config for user {user_id} not found.")
     return response.data
 
-@app.put("/admin/ai-config", response_model=AiConfig)
-async def update_ai_config(config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    try:
-        await supabase.from_("ai_config").update(config.model_dump()).eq("id", 1).execute()
-        response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
-        if not response.data: raise HTTPException(status_code=500, detail="Failed to update or retrieve AI config.")
-        return response.data
-    except Exception as e:
-        print(f"Error updating AI config: {e}")
-        raise HTTPException(status_code=500, detail="An internal error occurred while updating AI config.")
+@app.put("/admin/users/{user_id}/ai-config", response_model=AiConfig)
+async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    response = await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).select("*").single().execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to update AI config for user.")
+    return response.data
 
 # --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
@@ -300,6 +291,22 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
          raise HTTPException(status_code=500, detail="Could not update or find API key after generation.")
     return ApiKeyResponse(api_key=new_key)
 
+@app.get("/merchant/ai-config", response_model=AiConfig)
+async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    response = await supabase.from_("profiles").select("success_rate_weight, cost_weight, speed_weight").eq("id", user_id).single().execute()
+    if not response.data:
+        raise HTTPException(status_code=404, detail="AI config not found for current user.")
+    return response.data
+
+@app.put("/merchant/ai-config", response_model=AiConfig)
+async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    response = await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).select("*").single().execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to update AI config.")
+    return response.data
+
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(
     transaction: Transaction,
@@ -307,9 +314,9 @@ async def route_transaction(
 ):
     user_id = current_user.id
     
-    config_response = await supabase.from_("ai_config").select("*").eq("id", 1).single().execute()
+    config_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not config_response.data:
-        raise HTTPException(status_code=500, detail="AI configuration not found.")
+        raise HTTPException(status_code=500, detail="AI configuration for user not found.")
     ai_config = config_response.data
     
     await supabase.from_("transactions").upsert({
