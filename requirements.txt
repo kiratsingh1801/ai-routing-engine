@@ -4,3 +4,4 @@ google-generativeai
 supabase
 pydantic
 python-dotenv
+email-validator
