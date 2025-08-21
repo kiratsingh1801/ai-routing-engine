@@ -270,11 +270,22 @@ async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_use
     response = await supabase.from_("psps").select("*").order("id").execute()
     return response.data
 
+# main.py - Replace the old create_psp function
+
 @app.post("/admin/psps", response_model=Psp)
 async def create_psp(psp: PspCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("psps").insert(psp.model_dump()).select("*").single().execute()
-    if not response.data: raise HTTPException(status_code=500, detail="Failed to create PSP.")
-    return response.data
+    # Step 1: Insert the new data and get the returned record.
+    # The .insert() method returns the newly created data in its response.
+    insert_response = await supabase.from_("psps").insert(psp.model_dump()).execute()
+
+    # Error handling to ensure the insert was successful
+    if not insert_response.data:
+        raise HTTPException(status_code=500, detail="Failed to create PSP.")
+
+    # The newly created PSP is the first item in the response data list
+    new_psp = insert_response.data[0]
+
+    return new_psp
 
 # main.py - Replace the old update_psp function
 
