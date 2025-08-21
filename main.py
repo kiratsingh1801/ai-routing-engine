@@ -73,7 +73,7 @@ class PspBase(BaseModel):
     is_active: Optional[bool] = True
     supported_countries: Optional[List[str]] = None
     supported_payment_methods: Optional[List[str]] = None
-
+    supported_currencies: Optional[List[str]] = None # New field
 
 class PspCreate(PspBase):
     pass
@@ -161,7 +161,6 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 
 # --- Helper Functions ---
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
-    # CORRECTED: This prompt is now much more intelligent and less rigid.
     strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
 
 Your decision should be guided by these strategic weights, which define what is most important:
@@ -217,7 +216,6 @@ def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
 # --- Admin Endpoints ---
-# ... (All admin endpoints are the same as the last complete version)
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.auth.admin.list_users()
@@ -294,19 +292,20 @@ async def route_transaction(
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
     
-    # CORRECTED: We now filter PSPs based on the transaction's country and payment method
+    # CORRECTED: We now filter by currency as well
     query = supabase.from_("psps").select("*").eq("is_active", True)
     if transaction.country:
         query = query.contains("supported_countries", [transaction.country])
+    if transaction.currency:
+        query = query.contains("supported_currencies", [transaction.currency])
     if transaction.payment_method:
         query = query.contains("supported_payment_methods", [transaction.payment_method])
     
     psps_response = await query.execute()
     active_psps = psps_response.data
     
-    # CORRECTED: Handle the case where no PSPs are found for the route
     if not active_psps:
-        return RoutingResponse(ranked_psps=[]) # Return an empty list
+        return RoutingResponse(ranked_psps=[])
     
     psp_ids = [psp['id'] for psp in active_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
