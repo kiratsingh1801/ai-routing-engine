@@ -105,6 +105,10 @@ class InvitationVerify(BaseModel):
 class InvitationDetails(BaseModel):
     email: EmailStr
     role: str
+
+# Add this with your other Pydantic models near the top
+class MessageResponse(BaseModel):
+    message: str
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -276,24 +280,31 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     return response
 
 # --- NEW: Invite User Endpoint ---
-# main.py (replace the existing invite_user function with this final, correct version)
-
-@app.post("/admin/invite")
+# main.py (replace the invite_user function with this final, improved version)
+@app.post("/admin/invite", response_model=MessageResponse) # <-- MODEL ADDED HERE
 async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # CORRECTED: Use the official admin function to list all users and check if the email exists.
-    # This is the most reliable method.
     try:
         list_users_response = await supabase.auth.admin.list_users()
+
+        # The logic inside remains the same
         email_exists = any(user.email == invitation.email for user in list_users_response.users)
-        
+
         if email_exists:
             raise HTTPException(status_code=400, detail="A user with this email already exists.")
 
     except Exception as e:
-        print(f"An unexpected error occurred while listing users: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please check the server logs.")
+        # Acknowledging the previous error, I've noticed the Supabase response object structure can vary.
+        # This defensive check handles both cases (list directly, or object with a .users attribute).
+        if "'list' object has no attribute 'users'" in str(e):
+             # If we get the list directly, we handle it here.
+             email_exists_in_list = any(user.email == invitation.email for user in list_users_response)
+             if email_exists_in_list:
+                 raise HTTPException(status_code=400, detail="A user with this email already exists.")
+        else:
+             print(f"An unexpected error occurred while listing users: {e}")
+             raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please check the server logs.")
 
-    # If the user does not exist, the rest of the function proceeds as normal.
+    # If the user does not exist, the rest of the function proceeds
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now() + timedelta(days=7)
 
@@ -309,7 +320,7 @@ async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, 
     invitation_link = f"https://ai-routing-v2.vercel.app/signup?invitation_token={token}"
     await send_invitation_email(invitation.email, invitation_link)
 
-    return {"message": "Invitation sent successfully."}
+    return MessageResponse(message="Invitation sent successfully.")
 
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
