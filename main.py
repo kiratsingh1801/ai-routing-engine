@@ -4,13 +4,16 @@ import google.generativeai as genai
 import json
 import asyncio
 import secrets
+import os
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import AsyncClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal, Annotated
 import uuid
 from datetime import datetime, timedelta
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # --- Pydantic models ---
 class Transaction(BaseModel):
@@ -90,6 +93,18 @@ class AiConfig(BaseModel):
     success_rate_weight: float
     cost_weight: float
     speed_weight: float
+
+# --- NEW: Invitation System Models ---
+class InvitationCreate(BaseModel):
+    email: EmailStr
+    role: Literal['merchant', 'admin']
+
+class InvitationVerify(BaseModel):
+    token: str
+
+class InvitationDetails(BaseModel):
+    email: EmailStr
+    role: str
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -112,7 +127,7 @@ app.add_middleware(
 )
 # --- End of CORS ---
 
-# --- Supabase and Gemini Config ---
+# --- Supabase, Gemini and SendGrid Config ---
 supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
@@ -132,13 +147,12 @@ async def get_current_user(authorization: Annotated[str | None, Header()] = None
 async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
     if not x_api_key:
         return None
-    
     profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
     if not profile_response.data:
         return None
-    
     user_id = profile_response.data['id']
     try:
+        # Note: This is an admin function. Ensure service key is used.
         user_response = await supabase.auth.admin.get_user_by_id(user_id)
         return user_response.user
     except Exception:
@@ -156,9 +170,10 @@ async def get_user_from_token_or_key(
 
 async def get_current_admin_user(current_user: Annotated[dict, Depends(get_current_user)]):
     if not current_user:
-         raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     user_id = current_user.id
     response = await supabase.from_("profiles").select("role").eq("id", user_id).single().execute()
+
     if response.data and response.data.get("role") == "admin":
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
@@ -172,40 +187,59 @@ def get_card_brand_from_bin(card_bin: str) -> Optional[str]:
     elif card_bin.startswith(('34', '37')): return 'amex'
     return 'unknown'
 
-async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
-    strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
+async def send_invitation_email(recipient_email: str, invitation_link: str):
+    if not config.SENDGRID_API_KEY or not config.SENDGRID_FROM_EMAIL:
+        print("WARNING: SendGrid API Key or From Email not configured. Skipping email.")
+        return
 
+    message = Mail(
+        from_email=config.SENDGRID_FROM_EMAIL,
+        to_emails=recipient_email,
+        subject='You have been invited to join WiseRoute',
+        html_content=f"""
+            <p>You've been invited to create an account on WiseRoute.</p>
+            <p>Please click the link below to get started:</p>
+            <a href="{invitation_link}">{invitation_link}</a>
+            <p>This link will expire in 7 days.</p>
+        """
+    )
+    try:
+        sg = SendGridAPIClient(config.SENDGRID_API_KEY)
+        response = await sg.send(message)
+        print(f"Invitation email sent to {recipient_email}, status code: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        # In a real app, you might want to handle this more gracefully
+        raise HTTPException(status_code=500, detail="Failed to send invitation email.")
+
+async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
+    # ... (this function is unchanged)
+    strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
 Your decision should be guided by these strategic weights, which define what is most important:
 - Success Rate Weight: {ai_config.get('success_rate_weight', 0.5)}
 - Cost Weight: {ai_config.get('cost_weight', 0.3)}
 - Speed Weight: {ai_config.get('speed_weight', 0.2)}
-
 Use these weights as your primary guide, but also use your own reasoning. Consider all the data provided: the PSP's general performance, its real-time success rate for this specific route, and the context of the transaction itself (amount, country, etc.).
-
 In the 'reason' field, provide a concise, expert justification for your score. Explain how the data and the strategic weights led to your decision.
 """
-    
     if transaction.transaction_type == 'payin':
         fee_percent = psp.get('payin_fee_percent', 0)
         success_rate = psp.get('payin_success_rate', 0)
     else: # payout
         fee_percent = psp.get('payout_fee_percent', 0)
         success_rate = psp.get('payout_success_rate', 0)
-
-    transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n    * Country: {transaction.country}"
+    transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n * Country: {transaction.country}"
     if transaction.payment_method:
-        transaction_details += f"\n    * Payment Method: {transaction.payment_method}"
+        transaction_details += f"\n * Payment Method: {transaction.payment_method}"
     if transaction.card_bin:
-        transaction_details += f"\n    * Card BIN: {transaction.card_bin}"
-    
+        transaction_details += f"\n * Card BIN: {transaction.card_bin}"
     historical_insights = ""
     if live_success_rate is not None:
         historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
-        
     prompt = f"""You are a world-class Payment Routing Analyst.
 **Your Guiding Strategy:** {strategy_instruction}
 **Transaction Details:**
-    {transaction_details}
+{transaction_details}
 **PSP Performance Data:**
 * Name: {psp.get('name')}
 * Overall Success Rate for this transaction type: {success_rate * 100:.1f}%
@@ -241,6 +275,41 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     if hasattr(response, 'users'): return response.users
     return response
 
+# --- NEW: Invite User Endpoint ---
+@app.post("/admin/invite")
+async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    # Check if user already exists
+    try:
+        existing_user = await supabase.auth.admin.get_user_by_email(invitation.email)
+        if existing_user:
+            raise HTTPException(status_code=400, detail="A user with this email already exists.")
+    except Exception as e:
+        # If get_user_by_email throws an error, it means the user does not exist, which is what we want.
+        # We need to be careful not to mask other potential errors.
+        if "User not found" not in str(e):
+             raise HTTPException(status_code=400, detail="A user with this email already exists.")
+
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(days=7)
+
+    # Upsert ensures that if we re-invite someone, their token is simply updated.
+    await supabase.from_("invitations").upsert({
+        "email": invitation.email,
+        "role": invitation.role,
+        "token": token,
+        "invited_by": admin_user.id,
+        "expires_at": expires_at.isoformat(),
+        "used_at": None # Ensure used_at is cleared on re-invite
+    }, on_conflict="email").execute()
+
+    # Send the invitation email
+    # IMPORTANT: The frontend URL must be correct
+    invitation_link = f"https://ai-routing-v2.vercel.app/signup?invitation_token={token}"
+    await send_invitation_email(invitation.email, invitation_link)
+
+    return {"message": "Invitation sent successfully."}
+
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.from_("psps").select("*").order("id").execute()
@@ -267,16 +336,36 @@ async def get_user_ai_config(user_id: uuid.UUID, admin_user: Annotated[dict, Dep
 
 @app.put("/admin/users/{user_id}/ai-config", response_model=AiConfig)
 async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # CORRECTED: The .select() method cannot be chained after .update() this way.
     await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
         raise HTTPException(status_code=500, detail="Failed to update AI config for user.")
     return response.data
 
-# --- Merchant Endpoints ---
+# --- Public & Merchant Endpoints ---
+
+# --- NEW: Verify Invitation Token Endpoint ---
+@app.post("/verify-invitation", response_model=InvitationDetails)
+async def verify_invitation_token(data: InvitationVerify):
+    token = data.token
+    response = await supabase.from_("invitations").select("*").eq("token", token).single().execute()
+
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Invitation not found. The link may be invalid.")
+
+    invitation = response.data
+    if invitation.get("used_at"):
+        raise HTTPException(status_code=400, detail="This invitation has already been used.")
+
+    expires_at = datetime.fromisoformat(invitation["expires_at"])
+    if datetime.now(expires_at.tzinfo) > expires_at:
+        raise HTTPException(status_code=400, detail="This invitation has expired.")
+
+    return InvitationDetails(email=invitation["email"], role=invitation["role"])
+
 @app.get("/api-key", response_model=ApiKeyResponse)
 async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
     response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
     if response.data:
@@ -285,16 +374,18 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 
 @app.post("/api-key/generate", response_model=ApiKeyResponse)
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
     await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
     if not response.data:
-         raise HTTPException(status_code=500, detail="Could not update or find API key after generation.")
+        raise HTTPException(status_code=500, detail="Could not update or find API key after generation.")
     return ApiKeyResponse(api_key=new_key)
 
 @app.get("/merchant/ai-config", response_model=AiConfig)
 async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_user)]):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
     response = await supabase.from_("profiles").select("success_rate_weight, cost_weight, speed_weight").eq("id", user_id).single().execute()
     if not response.data:
@@ -303,8 +394,8 @@ async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_use
 
 @app.put("/merchant/ai-config", response_model=AiConfig)
 async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, Depends(get_current_user)]):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
-    # CORRECTED: The .select() method cannot be chained after .update() this way.
     await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
@@ -316,42 +407,34 @@ async def route_transaction(
     transaction: Transaction,
     current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
 ):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
-    
     config_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not config_response.data:
         raise HTTPException(status_code=500, detail="AI configuration for user not found.")
     ai_config = config_response.data
-    
     await supabase.from_("transactions").upsert({
         "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
-    
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     all_active_psps = psps_response.data
     if not all_active_psps:
         return RoutingResponse(ranked_psps=[])
-
     compatible_psps = []
     card_brand = get_card_brand_from_bin(transaction.card_bin)
-
     for psp in all_active_psps:
         country_ok = transaction.country in psp.get("supported_countries", [])
         currency_ok = transaction.currency in psp.get("supported_currencies", [])
         pm_ok = transaction.payment_method in psp.get("supported_payment_methods", [])
         service_ok = transaction.transaction_type in psp.get("supported_services", [])
-        
         card_brand_ok = True
         if transaction.payment_method == 'credit_card' and card_brand:
             card_brand_ok = card_brand in psp.get("supported_card_brands", [])
-
         if country_ok and currency_ok and pm_ok and card_brand_ok and service_ok:
             compatible_psps.append(psp)
-
     if not compatible_psps:
         return RoutingResponse(ranked_psps=[])
-    
     psp_ids = [psp['id'] for psp in compatible_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
@@ -367,25 +450,22 @@ async def route_transaction(
         total_attempts = successes + failures
         if total_attempts > 0:
             live_psp_stats[psp_id] = successes / total_attempts
-    
     tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in compatible_psps]
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
     if not all_scores:
         return RoutingResponse(ranked_psps=[])
-    
     sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
     top_psps = sorted_psps[:3]
     ranked_response_list = [RankedPsp(rank=i + 1, **psp) for i, psp in enumerate(top_psps)]
-    
     if ranked_response_list:
         top_ranked_psp = ranked_response_list[0]
         await supabase.from_("transactions").update({"routed_psp_id": top_ranked_psp.psp_id, "status": "routed (AI choice)"}).eq("id", str(transaction.transaction_id)).execute()
-        
     return RoutingResponse(ranked_psps=ranked_response_list)
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
+    # ... (this endpoint is unchanged)
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -396,19 +476,18 @@ async def update_transaction_status(update_data: TransactionStatusUpdate):
 
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_user)]):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
     try:
         response = await supabase.from_("transactions").select("amount, status").eq("user_id", user_id).gte("created_at", twenty_four_hours_ago.isoformat()).execute()
         if not response.data:
             return DashboardStats(total_volume_24h=0, total_transactions_24h=0, success_rate_24h=0, avg_speed="N/A")
-        
         transactions = response.data
         total_volume = sum(t['amount'] for t in transactions if t.get('amount'))
         total_transactions = len(transactions)
         completed_transactions = len([t for t in transactions if t.get('status') and t.get('status').lower() == 'completed'])
         success_rate = (completed_transactions / total_transactions * 100) if total_transactions > 0 else 0
-        
         return DashboardStats(total_volume_24h=total_volume, total_transactions_24h=total_transactions, success_rate_24h=success_rate, avg_speed="1.2s")
     except Exception as e:
         print(f"Error fetching dashboard stats: {e}")
@@ -417,9 +496,10 @@ async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_
 @app.get("/transactions", response_model=PaginatedTransactionsResponse)
 async def get_transactions(
     current_user: Annotated[dict, Depends(get_current_user)],
-    page: int = 1, 
+    page: int = 1,
     page_size: int = 10
 ):
+    # ... (this endpoint is unchanged)
     user_id = current_user.id
     try:
         offset = (page - 1) * page_size
@@ -429,10 +509,8 @@ async def get_transactions(
             .order("created_at", desc=True) \
             .range(offset, offset + page_size - 1) \
             .execute()
-        
         transactions_data = response.data or []
         total_count = response.count or 0
-        
         return PaginatedTransactionsResponse(
             transactions=transactions_data,
             total_count=total_count,
