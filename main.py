@@ -276,25 +276,16 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     return response
 
 # --- NEW: Invite User Endpoint ---
-# main.py (replace the existing invite_user function with this one)
+# main.py (replace the existing invite_user function with this final version)
 
 @app.post("/admin/invite")
 async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    # Check if user already exists
-    try:
-        # This is the function call that is likely failing for an unknown reason.
-        existing_user_response = await supabase.auth.admin.get_user_by_email(invitation.email)
-        
-        # If the call succeeds and we get a user, they exist.
-        if existing_user_response and existing_user_response.user:
-             raise HTTPException(status_code=400, detail="A user with this email already exists.")
+    # CORRECTED: Use a direct query to the auth schema to check for an existing user.
+    # This requires the SERVICE_ROLE_KEY, which we are already using.
+    response = await supabase.from_("users", schema="auth").select("id").eq("email", invitation.email).execute()
 
-    except Exception as e:
-        # If the exception message from Supabase is NOT 'User not found', then some other error occurred.
-        # We will now print the REAL error to the logs and raise a more helpful message.
-        if "User not found" not in str(e):
-            print(f"An unexpected error occurred while checking for user: {e}")
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please check the server logs.")
+    if response.data:
+        raise HTTPException(status_code=400, detail="A user with this email already exists.")
 
     # If the user does not exist, the rest of the function proceeds as normal.
     token = secrets.token_urlsafe(32)
