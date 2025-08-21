@@ -267,7 +267,9 @@ async def get_user_ai_config(user_id: uuid.UUID, admin_user: Annotated[dict, Dep
 
 @app.put("/admin/users/{user_id}/ai-config", response_model=AiConfig)
 async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
-    response = await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).select("*").single().execute()
+    # CORRECTED: The .select() method cannot be chained after .update() this way.
+    await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
+    response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not response.data:
         raise HTTPException(status_code=500, detail="Failed to update AI config for user.")
     return response.data
