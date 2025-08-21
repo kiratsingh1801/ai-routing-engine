@@ -73,7 +73,8 @@ class PspBase(BaseModel):
     is_active: Optional[bool] = True
     supported_countries: Optional[List[str]] = None
     supported_payment_methods: Optional[List[str]] = None
-    supported_currencies: Optional[List[str]] = None # New field
+    supported_currencies: Optional[List[str]] = None
+    supported_card_brands: Optional[List[str]] = None
 
 class PspCreate(PspBase):
     pass
@@ -160,6 +161,17 @@ async def get_current_admin_user(current_user: Annotated[dict, Depends(get_curre
 # --- End of Authentication ---
 
 # --- Helper Functions ---
+def get_card_brand_from_bin(card_bin: str) -> Optional[str]:
+    if not card_bin:
+        return None
+    if card_bin.startswith('4'):
+        return 'visa'
+    elif card_bin.startswith('5'):
+        return 'mastercard'
+    elif card_bin.startswith(('34', '37')):
+        return 'amex'
+    return 'unknown'
+
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
     strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
 
@@ -292,22 +304,30 @@ async def route_transaction(
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
     
-    # CORRECTED: We now filter by currency as well
-    query = supabase.from_("psps").select("*").eq("is_active", True)
-    if transaction.country:
-        query = query.contains("supported_countries", [transaction.country])
-    if transaction.currency:
-        query = query.contains("supported_currencies", [transaction.currency])
-    if transaction.payment_method:
-        query = query.contains("supported_payment_methods", [transaction.payment_method])
-    
-    psps_response = await query.execute()
-    active_psps = psps_response.data
-    
-    if not active_psps:
+    psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
+    all_active_psps = psps_response.data
+    if not all_active_psps:
+        return RoutingResponse(ranked_psps=[])
+
+    compatible_psps = []
+    card_brand = get_card_brand_from_bin(transaction.card_bin)
+
+    for psp in all_active_psps:
+        country_ok = transaction.country in psp.get("supported_countries", [])
+        currency_ok = transaction.currency in psp.get("supported_currencies", [])
+        pm_ok = transaction.payment_method in psp.get("supported_payment_methods", [])
+        
+        card_brand_ok = True
+        if transaction.payment_method == 'credit_card' and card_brand:
+            card_brand_ok = card_brand in psp.get("supported_card_brands", [])
+
+        if country_ok and currency_ok and pm_ok and card_brand_ok:
+            compatible_psps.append(psp)
+
+    if not compatible_psps:
         return RoutingResponse(ranked_psps=[])
     
-    psp_ids = [psp['id'] for psp in active_psps]
+    psp_ids = [psp['id'] for psp in compatible_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
     if transaction.payment_method:
@@ -323,7 +343,7 @@ async def route_transaction(
         if total_attempts > 0:
             live_psp_stats[psp_id] = successes / total_attempts
     
-    tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in active_psps]
+    tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in compatible_psps]
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
     if not all_scores:
