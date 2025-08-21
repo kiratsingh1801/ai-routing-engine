@@ -1,13 +1,13 @@
 # config.py
-# Import the variables directly from our app_secrets file
-import app_secrets
+import os
+from dotenv import load_dotenv
 
-# Supabase and Gemini Keys
-SUPABASE_URL = app_secrets.SUPABASE_URL
-SUPABASE_SERVICE_KEY = app_secrets.SUPABASE_SERVICE_KEY
-GEMINI_API_KEY = app_secrets.GEMINI_API_KEY
+# This line loads the .env file for local development.
+# On Render, it does nothing, and the code reads the server's environment variables.
+load_dotenv()
 
-# --- NEW LINES ---
-# SendGrid Keys
-SENDGRID_API_KEY = app_secrets.SENDGRID_API_KEY
-SENDGRID_FROM_EMAIL = app_secrets.SENDGRID_FROM_EMAIL
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
