@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 
 # --- Pydantic models ---
+# NOTE: All models are confirmed to be correct and require no changes.
 class Transaction(BaseModel):
     transaction_id: uuid.UUID
     amount: float = Field(..., example=100.00)
@@ -110,10 +111,7 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
-origins = [
-    "http://localhost:5173",
-    "https://ai-routing-v2.vercel.app",
-]
+origins = [ "http://localhost:5173", "https://ai-routing-v2.vercel.app" ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -131,41 +129,33 @@ gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 
 # --- Authentication Dependencies ---
 async def get_current_user(authorization: Annotated[str | None, Header()] = None):
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
+    if not authorization or not authorization.startswith("Bearer "): return None
     token = authorization.split(" ")[1]
     try:
         user_response = await supabase.auth.get_user(jwt=token)
         return user_response.user
-    except Exception:
-        return None
+    except Exception: return None
 
 async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
-    if not x_api_key:
-        return None
+    if not x_api_key: return None
     profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
-    if not profile_response.data:
-        return None
+    if not profile_response.data: return None
     user_id = profile_response.data['id']
     try:
         user_response = await supabase.auth.admin.get_user_by_id(user_id)
         return user_response.user
-    except Exception:
-        return None
+    except Exception: return None
 
 async def get_user_from_token_or_key(
     user_from_jwt: Annotated[dict | None, Depends(get_current_user)] = None,
     user_from_api_key: Annotated[dict | None, Depends(get_user_from_api_key)] = None
 ):
-    if user_from_jwt:
-        return user_from_jwt
-    if user_from_api_key:
-        return user_from_api_key
+    if user_from_jwt: return user_from_jwt
+    if user_from_api_key: return user_from_api_key
     raise HTTPException(status_code=401, detail="Not authenticated: No valid token or API key provided")
 
 async def get_current_admin_user(current_user: Annotated[dict, Depends(get_current_user)]):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not current_user: raise HTTPException(status_code=401, detail="Not authenticated")
     user_id = current_user.id
     response = await supabase.from_("profiles").select("role").eq("id", user_id).single().execute()
     if response.data and response.data.get("role") == "admin":
@@ -181,6 +171,56 @@ def get_card_brand_from_bin(card_bin: str) -> Optional[str]:
     elif card_bin.startswith(('34', '37')): return 'amex'
     return 'unknown'
 
+async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
+    strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
+Your decision should be guided by these strategic weights, which define what is most important:
+- Success Rate Weight: {ai_config.get('success_rate_weight', 0.5)}
+- Cost Weight: {ai_config.get('cost_weight', 0.3)}
+- Speed Weight: {ai_config.get('speed_weight', 0.2)}
+Use these weights as your primary guide, but also use your own reasoning. Consider all the data provided: the PSP's general performance, its real-time success rate for this specific route, and the context of the transaction itself (amount, country, etc.).
+In the 'reason' field, provide a concise, expert justification for your score. Explain how the data and the strategic weights led to your decision.
+"""
+    if transaction.transaction_type == 'payin':
+        fee_percent = psp.get('payin_fee_percent', 0)
+        success_rate = psp.get('payin_success_rate', 0)
+    else: # payout
+        fee_percent = psp.get('payout_fee_percent', 0)
+        success_rate = psp.get('payout_success_rate', 0)
+    transaction_details = f"* Amount: {transaction.amount} {transaction.currency}\n * Country: {transaction.country}"
+    if transaction.payment_method:
+        transaction_details += f"\n * Payment Method: {transaction.payment_method}"
+    if transaction.card_bin:
+        transaction_details += f"\n * Card BIN: {transaction.card_bin}"
+    historical_insights = ""
+    if live_success_rate is not None:
+        historical_insights = f"* Live Success Rate (this route, last 7 days): {live_success_rate:.1%}"
+    prompt = f"""You are a world-class Payment Routing Analyst.
+**Your Guiding Strategy:** {strategy_instruction}
+**Transaction Details:**
+{transaction_details}
+**PSP Performance Data:**
+* Name: {psp.get('name')}
+* Overall Success Rate for this transaction type: {success_rate * 100:.1f}%
+* Fee for this transaction type: {fee_percent}%
+* Speed Score (0 to 1): {psp.get('speed_score')}
+* Risk Score (0 to 1, higher is worse): {psp.get('risk_score')}
+**Live Historical Insights:**
+{historical_insights if historical_insights else "No recent transaction history for this specific route."}
+IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
+{{
+"score": <your_final_score_here>,
+"reason": "<your_expert_justification_here>"
+}}"""
+    try:
+        ai_response = await gemini_model.generate_content_async(prompt)
+        cleaned_response_text = ai_response.text.strip().replace("```json", "").replace("```", "")
+        score_data = json.loads(cleaned_response_text)
+        return {"psp_id": psp.get('id'), "psp_name": psp.get('name'), "score": score_data.get('score'), "reason": score_data.get('reason')}
+    except Exception as e:
+        print(f"Error scoring PSP {psp.get('name')}: {e}")
+        return None
+# --- End of Helper Functions ---
+
 # --- API Endpoints ---
 @app.get("/")
 def read_root():
@@ -191,38 +231,29 @@ def read_root():
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     auth_response = await supabase.auth.admin.list_users()
     profiles_response = await supabase.from_("profiles").select("id, role").execute()
-    
     profiles_map = {profile['id']: profile['role'] for profile in profiles_response.data}
-    
     merged_users = []
-    # This is the corrected logic that iterates through the .users attribute
     for user in auth_response.users:
         user_dict = user.model_dump()
         user_dict['role'] = profiles_map.get(str(user.id))
         merged_users.append(AdminUser(**user_dict))
-        
     return merged_users
 
 @app.put("/admin/users/{user_id}", response_model=AdminUser)
 async def update_user_role(user_id: uuid.UUID, user_update: UserUpdate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     await supabase.from_("profiles").update({"role": user_update.role}).eq("id", str(user_id)).execute()
-    
     auth_user_response = await supabase.auth.admin.get_user_by_id(str(user_id))
     profile_response = await supabase.from_("profiles").select("id, role").eq("id", str(user_id)).single().execute()
-
     if not auth_user_response or not profile_response.data:
         raise HTTPException(status_code=404, detail="User not found after update.")
-
     user_dict = auth_user_response.user.model_dump()
     user_dict['role'] = profile_response.data.get('role')
-    
     return AdminUser(**user_dict)
 
 @app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(user_id: uuid.UUID, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     if str(admin_user.id) == str(user_id):
         raise HTTPException(status_code=400, detail="Admins cannot delete their own account.")
-    
     await supabase.auth.admin.delete_user(str(user_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -237,7 +268,6 @@ async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, 
     except Exception as e:
         if 'User already exists' in str(e):
             raise HTTPException(status_code=400, detail="A user with this email already exists.")
-        
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
 
@@ -291,7 +321,10 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
     await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
-    return ApiKeyResponse(api_key=new_key)
+    response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Could not find API key after generation.")
+    return ApiKeyResponse(api_key=response.data.get("api_key"))
 
 @app.get("/merchant/ai-config", response_model=AiConfig)
 async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_user)]):
@@ -342,24 +375,33 @@ async def route_transaction(
             compatible_psps.append(psp)
     if not compatible_psps:
         return RoutingResponse(ranked_psps=[])
-    
-    # AI scoring logic is intensive, so we will skip it for now and focus on the main logic
-    # In a real scenario, the get_psp_score function would be called here for each compatible PSP
-    scored_psps = [
-        {"psp_id": psp.get('id'), "psp_name": psp.get('name'), "score": 90, "reason": "High success rate"}
-        for psp in compatible_psps
-    ]
-
-    sorted_psps = sorted(scored_psps, key=lambda psp: psp['score'], reverse=True)
+    psp_ids = [psp['id'] for psp in compatible_psps]
+    seven_days_ago = datetime.now() - timedelta(days=7)
+    history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
+    if transaction.payment_method:
+        history_query = history_query.eq("payment_method", transaction.payment_method)
+    history_response = await history_query.execute()
+    historical_data = history_response.data
+    live_psp_stats = {}
+    for psp_id in psp_ids:
+        psp_transactions = [t for t in historical_data if t.get('routed_psp_id') == psp_id]
+        successes = len([t for t in psp_transactions if t.get('status') and t.get('status').lower() == 'completed'])
+        failures = len([t for t in psp_transactions if t.get('status') and t.get('status').lower() == 'failed'])
+        total_attempts = successes + failures
+        if total_attempts > 0:
+            live_psp_stats[psp_id] = successes / total_attempts
+    tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in compatible_psps]
+    results = await asyncio.gather(*tasks)
+    all_scores = [res for res in results if res is not None]
+    if not all_scores:
+        return RoutingResponse(ranked_psps=[])
+    sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
     top_psps = sorted_psps[:3]
     ranked_response_list = [RankedPsp(rank=i + 1, **psp) for i, psp in enumerate(top_psps)]
-    
     if ranked_response_list:
         top_ranked_psp = ranked_response_list[0]
         await supabase.from_("transactions").update({"routed_psp_id": top_ranked_psp.psp_id, "status": "routed (AI choice)"}).eq("id", str(transaction.transaction_id)).execute()
-
     return RoutingResponse(ranked_psps=ranked_response_list)
-
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
