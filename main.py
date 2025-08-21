@@ -238,7 +238,6 @@ def read_root():
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.auth.admin.list_users()
-    # The response object from list_users() has a .users attribute
     return response.users
 
 @app.post("/admin/invite", response_model=MessageResponse)
