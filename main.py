@@ -113,41 +113,52 @@ gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 # --- Authentication Dependencies ---
 async def get_current_user(authorization: Annotated[str | None, Header()] = None):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+        # This is not an error, just means no JWT was provided.
+        return None
     token = authorization.split(" ")[1]
     try:
         user_response = await supabase.auth.get_user(jwt=token)
-        user = user_response.user
-        if user: return user
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
-    except Exception as e:
-        print(f"Authentication error: {e}")
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+        return user_response.user
+    except Exception:
+        # Invalid JWT, fall through to check API key
+        return None
+
+async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
+    if not x_api_key:
+        # This is not an error, just means no API key was provided.
+        return None
+    
+    profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
+    if not profile_response.data:
+        # Invalid API Key
+        return None
+    
+    user_id = profile_response.data['id']
+    try:
+        user_response = await supabase.auth.admin.get_user_by_id(user_id)
+        return user_response.user
+    except Exception:
+        # User might have been deleted, but profile still exists
+        return None
+
+async def get_user_from_token_or_key(
+    user_from_jwt: Annotated[dict | None, Depends(get_current_user)] = None,
+    user_from_api_key: Annotated[dict | None, Depends(get_user_from_api_key)] = None
+):
+    if user_from_jwt:
+        return user_from_jwt
+    if user_from_api_key:
+        return user_from_api_key
+    raise HTTPException(status_code=401, detail="Not authenticated: No valid token or API key provided")
 
 async def get_current_admin_user(current_user: Annotated[dict, Depends(get_current_user)]):
+    if not current_user:
+         raise HTTPException(status_code=401, detail="Not authenticated")
     user_id = current_user.id
     response = await supabase.from_("profiles").select("role").eq("id", user_id).single().execute()
     if response.data and response.data.get("role") == "admin":
         return current_user
     raise HTTPException(status_code=403, detail="Forbidden: User is not an admin")
-
-async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = None):
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-API-Key header missing")
-    
-    profile_response = await supabase.from_("profiles").select("id").eq("api_key", x_api_key).single().execute()
-    if not profile_response.data:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    
-    user_id = profile_response.data['id']
-    
-    try:
-        user_response = await supabase.auth.admin.get_user_by_id(user_id)
-        if user_response.user:
-            return user_response.user
-        raise HTTPException(status_code=404, detail="User not found for this API key")
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not retrieve user from API key")
 # --- End of Authentication ---
 
 # --- Helper Functions ---
