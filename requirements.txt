@@ -5,3 +5,4 @@ supabase
 pydantic
 sendgrid
 email-validator
+python-dotenv
