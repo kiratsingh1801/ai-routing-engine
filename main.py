@@ -4,7 +4,6 @@ import google.generativeai as genai
 import json
 import asyncio
 import secrets
-import os
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import AsyncClient
@@ -12,8 +11,6 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Literal, Annotated
 import uuid
 from datetime import datetime, timedelta
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 
 # --- Pydantic models ---
 class Transaction(BaseModel):
@@ -94,19 +91,11 @@ class AiConfig(BaseModel):
     cost_weight: float
     speed_weight: float
 
-# --- NEW: Invitation System Models ---
+# --- Simplified Invitation Models ---
 class InvitationCreate(BaseModel):
     email: EmailStr
     role: Literal['merchant', 'admin']
 
-class InvitationVerify(BaseModel):
-    token: str
-
-class InvitationDetails(BaseModel):
-    email: EmailStr
-    role: str
-
-# Add this with your other Pydantic models near the top
 class MessageResponse(BaseModel):
     message: str
 # --- End of Pydantic models ---
@@ -131,7 +120,7 @@ app.add_middleware(
 )
 # --- End of CORS ---
 
-# --- Supabase, Gemini and SendGrid Config ---
+# --- Supabase and Gemini Config ---
 supabase: AsyncClient = AsyncClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 genai.configure(api_key=config.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
@@ -156,7 +145,6 @@ async def get_user_from_api_key(x_api_key: Annotated[str | None, Header()] = Non
         return None
     user_id = profile_response.data['id']
     try:
-        # Note: This is an admin function. Ensure service key is used.
         user_response = await supabase.auth.admin.get_user_by_id(user_id)
         return user_response.user
     except Exception:
@@ -191,33 +179,7 @@ def get_card_brand_from_bin(card_bin: str) -> Optional[str]:
     elif card_bin.startswith(('34', '37')): return 'amex'
     return 'unknown'
 
-async def send_invitation_email(recipient_email: str, invitation_link: str):
-    if not config.SENDGRID_API_KEY or not config.SENDGRID_FROM_EMAIL:
-        print("WARNING: SendGrid API Key or From Email not configured. Skipping email.")
-        return
-
-    message = Mail(
-        from_email=config.SENDGRID_FROM_EMAIL,
-        to_emails=recipient_email,
-        subject='You have been invited to join WiseRoute',
-        html_content=f"""
-            <p>You've been invited to create an account on WiseRoute.</p>
-            <p>Please click the link below to get started:</p>
-            <a href="{invitation_link}">{invitation_link}</a>
-            <p>This link will expire in 7 days.</p>
-        """
-    )
-    try:
-        sg = SendGridAPIClient(config.SENDGRID_API_KEY)
-        response = await sg.send(message)
-        print(f"Invitation email sent to {recipient_email}, status code: {response.status_code}")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-        # In a real app, you might want to handle this more gracefully
-        raise HTTPException(status_code=500, detail="Failed to send invitation email.")
-
 async def get_psp_score(psp: dict, transaction: Transaction, live_success_rate: Optional[float], ai_config: dict) -> Optional[dict]:
-    # ... (this function is unchanged)
     strategy_instruction = f"""You are an AI expert in payment routing. Your goal is to score this PSP on a scale of 0-100 for the given transaction.
 Your decision should be guided by these strategic weights, which define what is most important:
 - Success Rate Weight: {ai_config.get('success_rate_weight', 0.5)}
@@ -276,51 +238,27 @@ def read_root():
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     response = await supabase.auth.admin.list_users()
-    if hasattr(response, 'users'): return response.users
-    return response
+    # The response object from list_users() has a .users attribute
+    return response.users
 
-# --- NEW: Invite User Endpoint ---
-# main.py (replace the invite_user function with this final, improved version)
-@app.post("/admin/invite", response_model=MessageResponse) # <-- MODEL ADDED HERE
+@app.post("/admin/invite", response_model=MessageResponse)
 async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     try:
-        list_users_response = await supabase.auth.admin.list_users()
-
-        # The logic inside remains the same
-        email_exists = any(user.email == invitation.email for user in list_users_response.users)
-
-        if email_exists:
-            raise HTTPException(status_code=400, detail="A user with this email already exists.")
-
+        # Use Supabase's built-in invitation method. It handles the token and email sending for us.
+        # We pass the desired role in the 'data' option.
+        await supabase.auth.admin.invite_user_by_email(
+            email=invitation.email,
+            options={'data': {'role': invitation.role}}
+        )
+        return MessageResponse(message=f"Invitation successfully sent to {invitation.email}.")
     except Exception as e:
-        # Acknowledging the previous error, I've noticed the Supabase response object structure can vary.
-        # This defensive check handles both cases (list directly, or object with a .users attribute).
-        if "'list' object has no attribute 'users'" in str(e):
-             # If we get the list directly, we handle it here.
-             email_exists_in_list = any(user.email == invitation.email for user in list_users_response)
-             if email_exists_in_list:
-                 raise HTTPException(status_code=400, detail="A user with this email already exists.")
-        else:
-             print(f"An unexpected error occurred while listing users: {e}")
-             raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please check the server logs.")
-
-    # If the user does not exist, the rest of the function proceeds
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.now() + timedelta(days=7)
-
-    await supabase.from_("invitations").upsert({
-        "email": invitation.email,
-        "role": invitation.role,
-        "token": token,
-        "invited_by": admin_user.id,
-        "expires_at": expires_at.isoformat(),
-        "used_at": None
-    }, on_conflict="email").execute()
-
-    invitation_link = f"https://ai-routing-v2.vercel.app/signup?invitation_token={token}"
-    await send_invitation_email(invitation.email, invitation_link)
-
-    return MessageResponse(message="Invitation sent successfully.")
+        # If the user already exists, Supabase will raise an error.
+        # We catch it and return a user-friendly message.
+        if 'User already exists' in str(e):
+            raise HTTPException(status_code=400, detail="A user with this email already exists.")
+        
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected server error occurred.")
 
 @app.get("/admin/psps", response_model=List[Psp])
 async def get_all_psps(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
@@ -354,30 +292,9 @@ async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user
         raise HTTPException(status_code=500, detail="Failed to update AI config for user.")
     return response.data
 
-# --- Public & Merchant Endpoints ---
-
-# --- NEW: Verify Invitation Token Endpoint ---
-@app.post("/verify-invitation", response_model=InvitationDetails)
-async def verify_invitation_token(data: InvitationVerify):
-    token = data.token
-    response = await supabase.from_("invitations").select("*").eq("token", token).single().execute()
-
-    if not response.data:
-        raise HTTPException(status_code=404, detail="Invitation not found. The link may be invalid.")
-
-    invitation = response.data
-    if invitation.get("used_at"):
-        raise HTTPException(status_code=400, detail="This invitation has already been used.")
-
-    expires_at = datetime.fromisoformat(invitation["expires_at"])
-    if datetime.now(expires_at.tzinfo) > expires_at:
-        raise HTTPException(status_code=400, detail="This invitation has expired.")
-
-    return InvitationDetails(email=invitation["email"], role=invitation["role"])
-
+# --- Merchant Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
 async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     response = await supabase.from_("profiles").select("api_key").eq("id", user_id).single().execute()
     if response.data:
@@ -386,7 +303,6 @@ async def get_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
 
 @app.post("/api-key/generate", response_model=ApiKeyResponse)
 async def generate_api_key(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     new_key = f"sk_{secrets.token_urlsafe(24)}"
     await supabase.from_("profiles").update({"api_key": new_key}).eq("id", user_id).execute()
@@ -397,7 +313,6 @@ async def generate_api_key(current_user: Annotated[dict, Depends(get_current_use
 
 @app.get("/merchant/ai-config", response_model=AiConfig)
 async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     response = await supabase.from_("profiles").select("success_rate_weight, cost_weight, speed_weight").eq("id", user_id).single().execute()
     if not response.data:
@@ -406,7 +321,6 @@ async def get_my_ai_config(current_user: Annotated[dict, Depends(get_current_use
 
 @app.put("/merchant/ai-config", response_model=AiConfig)
 async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, Depends(get_current_user)]):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
     response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
@@ -419,7 +333,6 @@ async def route_transaction(
     transaction: Transaction,
     current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
 ):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     config_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not config_response.data:
@@ -477,7 +390,6 @@ async def route_transaction(
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
-    # ... (this endpoint is unchanged)
     try:
         response = await supabase.from_("transactions").update({"status": update_data.status}).eq("id", str(update_data.transaction_id)).execute()
         if not response.data:
@@ -488,7 +400,6 @@ async def update_transaction_status(update_data: TransactionStatusUpdate):
 
 @app.get("/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats(current_user: Annotated[dict, Depends(get_current_user)]):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     twenty_four_hours_ago = datetime.now() - timedelta(days=1)
     try:
@@ -511,7 +422,6 @@ async def get_transactions(
     page: int = 1,
     page_size: int = 10
 ):
-    # ... (this endpoint is unchanged)
     user_id = current_user.id
     try:
         offset = (page - 1) * page_size
