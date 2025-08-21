@@ -276,35 +276,39 @@ async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_us
     return response
 
 # --- NEW: Invite User Endpoint ---
+# main.py (replace the existing invite_user function with this one)
+
 @app.post("/admin/invite")
 async def invite_user(invitation: InvitationCreate, admin_user: Annotated[dict, Depends(get_current_admin_user)]):
     # Check if user already exists
     try:
-        existing_user = await supabase.auth.admin.get_user_by_email(invitation.email)
-        if existing_user:
-            raise HTTPException(status_code=400, detail="A user with this email already exists.")
-    except Exception as e:
-        # If get_user_by_email throws an error, it means the user does not exist, which is what we want.
-        # We need to be careful not to mask other potential errors.
-        if "User not found" not in str(e):
+        # This is the function call that is likely failing for an unknown reason.
+        existing_user_response = await supabase.auth.admin.get_user_by_email(invitation.email)
+        
+        # If the call succeeds and we get a user, they exist.
+        if existing_user_response and existing_user_response.user:
              raise HTTPException(status_code=400, detail="A user with this email already exists.")
 
+    except Exception as e:
+        # If the exception message from Supabase is NOT 'User not found', then some other error occurred.
+        # We will now print the REAL error to the logs and raise a more helpful message.
+        if "User not found" not in str(e):
+            print(f"An unexpected error occurred while checking for user: {e}")
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred. Please check the server logs.")
 
+    # If the user does not exist, the rest of the function proceeds as normal.
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now() + timedelta(days=7)
 
-    # Upsert ensures that if we re-invite someone, their token is simply updated.
     await supabase.from_("invitations").upsert({
         "email": invitation.email,
         "role": invitation.role,
         "token": token,
         "invited_by": admin_user.id,
         "expires_at": expires_at.isoformat(),
-        "used_at": None # Ensure used_at is cleared on re-invite
+        "used_at": None
     }, on_conflict="email").execute()
 
-    # Send the invitation email
-    # IMPORTANT: The frontend URL must be correct
     invitation_link = f"https://ai-routing-v2.vercel.app/signup?invitation_token={token}"
     await send_invitation_email(invitation.email, invitation_link)
 
