@@ -122,6 +122,15 @@ class RetryResponse(BaseModel):
     next_psp: Optional[Psp] = None
     message: str
 
+# Add this with your other Pydantic models
+
+class PspHealthStatus(BaseModel):
+    id: uuid.UUID
+    name: str
+    is_active: bool
+    last_health_check: Optional[datetime] = None
+    uptime_percentage_24h: Optional[float] = None
+
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -246,6 +255,13 @@ IMPORTANT: Respond ONLY with a valid JSON object of the following structure:
 def read_root():
     return {"message": "AI Payment Routing Engine is running."}
 
+# Add this new function after the read_root endpoint
+
+@app.get("/psps/health", response_model=List[PspHealthStatus])
+async def get_psp_health():
+    response = await supabase.from_("psps").select("id, name, is_active, last_health_check, uptime_percentage_24h").execute()
+    return response.data
+
 # --- Admin Endpoints ---
 @app.get("/admin/users", response_model=List[AdminUser])
 async def get_all_users(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
@@ -346,6 +362,46 @@ async def update_user_ai_config(user_id: uuid.UUID, config: AiConfig, admin_user
     if not response.data:
         raise HTTPException(status_code=500, detail="Failed to update AI config for user.")
     return response.data
+
+# Add this new function in the "Admin Endpoints" section
+
+@app.post("/admin/psps/run-health-checks", response_model=MessageResponse)
+async def run_psp_health_checks(admin_user: Annotated[dict, Depends(get_current_admin_user)]):
+    twenty_four_hours_ago = datetime.now() - timedelta(days=1)
+    
+    # 1. Get all PSPs
+    psps_response = await supabase.from_("psps").select("id").execute()
+    if not psps_response.data:
+        return MessageResponse(message="No PSPs found to check.")
+        
+    psp_ids = [psp['id'] for psp in psps_response.data]
+
+    # 2. Get all relevant transactions from the last 24 hours
+    transactions_response = await supabase.from_("transactions") \
+        .select("routed_psp_id, status") \
+        .in_("routed_psp_id", psp_ids) \
+        .gte("created_at", twenty_four_hours_ago.isoformat()) \
+        .execute()
+        
+    transactions = transactions_response.data
+
+    # 3. Calculate uptime for each PSP
+    for psp_id in psp_ids:
+        psp_transactions = [t for t in transactions if t.get('routed_psp_id') == psp_id]
+        
+        completed = len([t for t in psp_transactions if t.get('status', '').lower() == 'completed'])
+        failed = len([t for t in psp_transactions if t.get('status', '').lower() == 'failed'])
+        total_attempts = completed + failed
+        
+        uptime_percentage = (completed / total_attempts * 100) if total_attempts > 0 else 100.0
+
+        # 4. Update the PSP record in the database
+        await supabase.from_("psps").update({
+            "uptime_percentage_24h": uptime_percentage,
+            "last_health_check": datetime.now().isoformat()
+        }).eq("id", psp_id).execute()
+
+    return MessageResponse(message="PSP health checks completed successfully.")
 
 # --- Merchant & Shared Endpoints ---
 @app.get("/api-key", response_model=ApiKeyResponse)
