@@ -449,27 +449,28 @@ async def get_my_ab_test_config(current_user: Annotated[dict, Depends(get_curren
     response = await supabase.from_("profiles").select(
         "ab_testing_enabled, ab_test_psp_a_id, ab_test_psp_b_id, ab_test_split_percentage"
     ).eq("id", user_id).single().execute()
-    
     if not response.data:
         raise HTTPException(status_code=404, detail="A/B test config not found for current user.")
-        
     return response.data
 
 @app.put("/merchant/ab-test-config", response_model=AbTestConfig)
 async def update_my_ab_test_config(config: AbTestConfig, current_user: Annotated[dict, Depends(get_current_user)]):
     user_id = current_user.id
-    await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
+    # CORRECTED: Convert UUIDs to strings before saving
+    update_data = config.model_dump()
+    if update_data.get('ab_test_psp_a_id'):
+        update_data['ab_test_psp_a_id'] = str(update_data['ab_test_psp_a_id'])
+    if update_data.get('ab_test_psp_b_id'):
+        update_data['ab_test_psp_b_id'] = str(update_data['ab_test_psp_b_id'])
+        
+    await supabase.from_("profiles").update(update_data).eq("id", user_id).execute()
     
     response = await supabase.from_("profiles").select(
         "ab_testing_enabled, ab_test_psp_a_id, ab_test_psp_b_id, ab_test_split_percentage"
     ).eq("id", user_id).single().execute()
-
     if not response.data:
         raise HTTPException(status_code=500, detail="Failed to update A/B test config.")
-        
     return response.data
-
-# Replace the existing route_transaction function with this one
 
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(
@@ -477,49 +478,36 @@ async def route_transaction(
     current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
 ):
     user_id = current_user.id
-    
-    # Fetch user profile which now includes AI config and A/B test config
     profile_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
     if not profile_response.data:
         raise HTTPException(status_code=500, detail="Configuration for user not found.")
-    
     profile = profile_response.data
     
-    # --- A/B TESTING LOGIC ---
     if profile.get("ab_testing_enabled"):
         psp_a_id = profile.get("ab_test_psp_a_id")
         psp_b_id = profile.get("ab_test_psp_b_id")
         split = profile.get("ab_test_split_percentage", 50)
-
         if not psp_a_id or not psp_b_id:
              raise HTTPException(status_code=400, detail="A/B testing is enabled but PSPs are not configured.")
-
-        # Choose PSP based on the split percentage
         chosen_psp_id = psp_a_id if secrets.randbelow(100) < split else psp_b_id
-        
         psp_response = await supabase.from_("psps").select("*").eq("id", chosen_psp_id).single().execute()
         if not psp_response.data:
             raise HTTPException(status_code=404, detail="A/B test PSP not found.")
-            
         chosen_psp = psp_response.data
-        
-        # Create a simple routing response for the chosen PSP
         ranked_psp = RankedPsp(
             rank=1, 
             psp_id=chosen_psp['id'], 
             psp_name=chosen_psp['name'], 
-            score=100, # Score is arbitrary in A/B test
+            score=100,
             reason=f"A/B Test ({split}/{100-split} split)"
         )
         return RoutingResponse(ranked_psps=[ranked_psp])
 
-    # --- IF A/B TEST IS OFF, PROCEED WITH AI ROUTING ---
     ai_config = profile
     await supabase.from_("transactions").upsert({
         "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
-
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     all_active_psps = psps_response.data
     if not all_active_psps: return RoutingResponse(ranked_psps=[])
