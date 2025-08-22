@@ -112,8 +112,6 @@ class InvitationCreate(BaseModel):
 class MessageResponse(BaseModel):
     message: str
 
-# Add these with your other Pydantic models
-
 class RetryRequest(BaseModel):
     transaction_id: uuid.UUID
     failed_psp_id: uuid.UUID
@@ -122,14 +120,18 @@ class RetryResponse(BaseModel):
     next_psp: Optional[Psp] = None
     message: str
 
-# Add this with your other Pydantic models
-
 class PspHealthStatus(BaseModel):
     id: uuid.UUID
     name: str
     is_active: bool
     last_health_check: Optional[datetime] = None
     uptime_percentage_24h: Optional[float] = None
+
+class AbTestConfig(BaseModel):
+    ab_testing_enabled: bool
+    ab_test_psp_a_id: Optional[uuid.UUID] = None
+    ab_test_psp_b_id: Optional[uuid.UUID] = None
+    ab_test_split_percentage: int = Field(50, ge=0, le=100)
 
 # --- End of Pydantic models ---
 
@@ -441,6 +443,32 @@ async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, De
         raise HTTPException(status_code=500, detail="Failed to update AI config.")
     return response.data
 
+@app.get("/merchant/ab-test-config", response_model=AbTestConfig)
+async def get_my_ab_test_config(current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    response = await supabase.from_("profiles").select(
+        "ab_testing_enabled, ab_test_psp_a_id, ab_test_psp_b_id, ab_test_split_percentage"
+    ).eq("id", user_id).single().execute()
+    
+    if not response.data:
+        raise HTTPException(status_code=404, detail="A/B test config not found for current user.")
+        
+    return response.data
+
+@app.put("/merchant/ab-test-config", response_model=AbTestConfig)
+async def update_my_ab_test_config(config: AbTestConfig, current_user: Annotated[dict, Depends(get_current_user)]):
+    user_id = current_user.id
+    await supabase.from_("profiles").update(config.model_dump()).eq("id", user_id).execute()
+    
+    response = await supabase.from_("profiles").select(
+        "ab_testing_enabled, ab_test_psp_a_id, ab_test_psp_b_id, ab_test_split_percentage"
+    ).eq("id", user_id).single().execute()
+
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Failed to update A/B test config.")
+        
+    return response.data
+
 # Replace the existing route_transaction function with this one
 
 @app.post("/route-transaction", response_model=RoutingResponse)
@@ -449,12 +477,44 @@ async def route_transaction(
     current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
 ):
     user_id = current_user.id
-    config_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
-    if not config_response.data:
-        raise HTTPException(status_code=500, detail="AI configuration for user not found.")
-    ai_config = config_response.data
     
-    # First, create the transaction record so we can update it later
+    # Fetch user profile which now includes AI config and A/B test config
+    profile_response = await supabase.from_("profiles").select("*").eq("id", user_id).single().execute()
+    if not profile_response.data:
+        raise HTTPException(status_code=500, detail="Configuration for user not found.")
+    
+    profile = profile_response.data
+    
+    # --- A/B TESTING LOGIC ---
+    if profile.get("ab_testing_enabled"):
+        psp_a_id = profile.get("ab_test_psp_a_id")
+        psp_b_id = profile.get("ab_test_psp_b_id")
+        split = profile.get("ab_test_split_percentage", 50)
+
+        if not psp_a_id or not psp_b_id:
+             raise HTTPException(status_code=400, detail="A/B testing is enabled but PSPs are not configured.")
+
+        # Choose PSP based on the split percentage
+        chosen_psp_id = psp_a_id if secrets.randbelow(100) < split else psp_b_id
+        
+        psp_response = await supabase.from_("psps").select("*").eq("id", chosen_psp_id).single().execute()
+        if not psp_response.data:
+            raise HTTPException(status_code=404, detail="A/B test PSP not found.")
+            
+        chosen_psp = psp_response.data
+        
+        # Create a simple routing response for the chosen PSP
+        ranked_psp = RankedPsp(
+            rank=1, 
+            psp_id=chosen_psp['id'], 
+            psp_name=chosen_psp['name'], 
+            score=100, # Score is arbitrary in A/B test
+            reason=f"A/B Test ({split}/{100-split} split)"
+        )
+        return RoutingResponse(ranked_psps=[ranked_psp])
+
+    # --- IF A/B TEST IS OFF, PROCEED WITH AI ROUTING ---
+    ai_config = profile
     await supabase.from_("transactions").upsert({
         "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
@@ -462,10 +522,8 @@ async def route_transaction(
 
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     all_active_psps = psps_response.data
-    if not all_active_psps:
-        return RoutingResponse(ranked_psps=[])
+    if not all_active_psps: return RoutingResponse(ranked_psps=[])
     
-    # ... (Compatibility checks are the same)
     compatible_psps = []
     card_brand = get_card_brand_from_bin(transaction.card_bin)
     for psp in all_active_psps:
@@ -478,10 +536,8 @@ async def route_transaction(
             card_brand_ok = card_brand in psp.get("supported_card_brands", [])
         if country_ok and currency_ok and pm_ok and card_brand_ok and service_ok:
             compatible_psps.append(psp)
-    if not compatible_psps:
-        return RoutingResponse(ranked_psps=[])
+    if not compatible_psps: return RoutingResponse(ranked_psps=[])
     
-    # ... (AI scoring logic is the same)
     psp_ids = [psp['id'] for psp in compatible_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
@@ -495,29 +551,23 @@ async def route_transaction(
         successes = len([t for t in psp_transactions if t.get('status') and t.get('status').lower() == 'completed'])
         failures = len([t for t in psp_transactions if t.get('status') and t.get('status').lower() == 'failed'])
         total_attempts = successes + failures
-        if total_attempts > 0:
-            live_psp_stats[psp_id] = successes / total_attempts
+        if total_attempts > 0: live_psp_stats[psp_id] = successes / total_attempts
+    
     tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in compatible_psps]
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
-    if not all_scores:
-        return RoutingResponse(ranked_psps=[])
+    if not all_scores: return RoutingResponse(ranked_psps=[])
     
     sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
     
-    # --- NEW FAILOVER LOGIC ---
-    # 1. Create the full ranked list of PSP IDs for the cascade
     cascade_psp_ids = [psp['psp_id'] for psp in sorted_psps]
-
-    # 2. Save the cascade and the top choice to the database
     if cascade_psp_ids:
         await supabase.from_("transactions").update({
             "routed_psp_id": cascade_psp_ids[0],
             "status": "routed (AI choice)",
-            "routing_cascade": json.dumps(cascade_psp_ids) # Store as JSON string
+            "routing_cascade": json.dumps(cascade_psp_ids)
         }).eq("id", str(transaction.transaction_id)).execute()
 
-    # 3. Return the top 3 PSPs to the user as before
     top_psps = sorted_psps[:3]
     ranked_response_list = [RankedPsp(rank=i + 1, **psp) for i, psp in enumerate(top_psps)]
     
