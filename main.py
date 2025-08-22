@@ -111,6 +111,17 @@ class InvitationCreate(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+# Add these with your other Pydantic models
+
+class RetryRequest(BaseModel):
+    transaction_id: uuid.UUID
+    failed_psp_id: uuid.UUID
+
+class RetryResponse(BaseModel):
+    next_psp: Optional[Psp] = None
+    message: str
+
 # --- End of Pydantic models ---
 
 app = FastAPI(
@@ -374,6 +385,8 @@ async def update_my_ai_config(config: AiConfig, current_user: Annotated[dict, De
         raise HTTPException(status_code=500, detail="Failed to update AI config.")
     return response.data
 
+# Replace the existing route_transaction function with this one
+
 @app.post("/route-transaction", response_model=RoutingResponse)
 async def route_transaction(
     transaction: Transaction,
@@ -384,14 +397,19 @@ async def route_transaction(
     if not config_response.data:
         raise HTTPException(status_code=500, detail="AI configuration for user not found.")
     ai_config = config_response.data
+    
+    # First, create the transaction record so we can update it later
     await supabase.from_("transactions").upsert({
         "id": str(transaction.transaction_id), "user_id": user_id, "amount": transaction.amount,
         "currency": transaction.currency, "geo": transaction.country, "payment_method": transaction.payment_method,
     }).execute()
+
     psps_response = await supabase.from_("psps").select("*").eq("is_active", True).execute()
     all_active_psps = psps_response.data
     if not all_active_psps:
         return RoutingResponse(ranked_psps=[])
+    
+    # ... (Compatibility checks are the same)
     compatible_psps = []
     card_brand = get_card_brand_from_bin(transaction.card_bin)
     for psp in all_active_psps:
@@ -406,6 +424,8 @@ async def route_transaction(
             compatible_psps.append(psp)
     if not compatible_psps:
         return RoutingResponse(ranked_psps=[])
+    
+    # ... (AI scoring logic is the same)
     psp_ids = [psp['id'] for psp in compatible_psps]
     seven_days_ago = datetime.now() - timedelta(days=7)
     history_query = supabase.from_("transactions").select("routed_psp_id, status").in_("routed_psp_id", psp_ids).eq("geo", transaction.country).gte("created_at", seven_days_ago.isoformat())
@@ -421,23 +441,77 @@ async def route_transaction(
         total_attempts = successes + failures
         if total_attempts > 0:
             live_psp_stats[psp_id] = successes / total_attempts
-    
     tasks = [get_psp_score(psp, transaction, live_psp_stats.get(psp.get('id')), ai_config) for psp in compatible_psps]
     results = await asyncio.gather(*tasks)
     all_scores = [res for res in results if res is not None]
-    
     if not all_scores:
         return RoutingResponse(ranked_psps=[])
     
     sorted_psps = sorted(all_scores, key=lambda psp: psp['score'], reverse=True)
+    
+    # --- NEW FAILOVER LOGIC ---
+    # 1. Create the full ranked list of PSP IDs for the cascade
+    cascade_psp_ids = [psp['psp_id'] for psp in sorted_psps]
+
+    # 2. Save the cascade and the top choice to the database
+    if cascade_psp_ids:
+        await supabase.from_("transactions").update({
+            "routed_psp_id": cascade_psp_ids[0],
+            "status": "routed (AI choice)",
+            "routing_cascade": json.dumps(cascade_psp_ids) # Store as JSON string
+        }).eq("id", str(transaction.transaction_id)).execute()
+
+    # 3. Return the top 3 PSPs to the user as before
     top_psps = sorted_psps[:3]
     ranked_response_list = [RankedPsp(rank=i + 1, **psp) for i, psp in enumerate(top_psps)]
     
-    if ranked_response_list:
-        top_ranked_psp = ranked_response_list[0]
-        await supabase.from_("transactions").update({"routed_psp_id": top_ranked_psp.psp_id, "status": "routed (AI choice)"}).eq("id", str(transaction.transaction_id)).execute()
-
     return RoutingResponse(ranked_psps=ranked_response_list)
+
+# Add this new function after the route_transaction endpoint
+
+@app.post("/retry-transaction", response_model=RetryResponse)
+async def retry_transaction(
+    retry_request: RetryRequest,
+    current_user: Annotated[dict, Depends(get_user_from_token_or_key)]
+):
+    # 1. Fetch the original transaction
+    tx_response = await supabase.from_("transactions").select("*").eq("id", str(retry_request.transaction_id)).single().execute()
+    if not tx_response.data:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+    
+    transaction = tx_response.data
+    cascade = json.loads(transaction.get("routing_cascade", "[]"))
+
+    if not cascade:
+        return RetryResponse(next_psp=None, message="No routing cascade available for this transaction.")
+
+    # 2. Find the next PSP in the cascade
+    try:
+        current_index = cascade.index(str(retry_request.failed_psp_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Failed PSP not found in the original routing cascade.")
+
+    if current_index + 1 >= len(cascade):
+        return RetryResponse(next_psp=None, message="No more PSPs available in the routing cascade.")
+
+    next_psp_id = cascade[current_index + 1]
+
+    # 3. Fetch the full details of the next PSP
+    psp_response = await supabase.from_("psps").select("*").eq("id", next_psp_id).single().execute()
+    if not psp_response.data:
+        raise HTTPException(status_code=404, detail="Next PSP in cascade could not be found.")
+
+    next_psp = psp_response.data
+
+    # 4. Update the transaction to log the retry attempt
+    new_retry_count = transaction.get("retry_attempts", 0) + 1
+    await supabase.from_("transactions").update({
+        "routed_psp_id": next_psp_id,
+        "status": f"retrying (attempt {new_retry_count})",
+        "retry_attempts": new_retry_count
+    }).eq("id", str(retry_request.transaction_id)).execute()
+
+    return RetryResponse(next_psp=Psp(**next_psp), message="Retry successful. Please use the next PSP.")
 
 @app.post("/update-transaction-status")
 async def update_transaction_status(update_data: TransactionStatusUpdate):
